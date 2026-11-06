@@ -1,0 +1,13 @@
+node_modules/
+app.db
+app.db-shm
+app.db-wal
+*.db
+.bun-cache/
+.harness/
+.space-build/
+.space-build-cvm/
+audits/
+dist/
+.env
+.env.*

@@ -1,0 +1,69 @@
+@import "tailwindcss";
+@import "tailwindcss-safe-area";
+
+@theme {
+  --text-xs: 12px;
+  --text-xs--line-height: 16px;
+  --text-sm: 14px;
+  --text-sm--line-height: 20px;
+  --text-base: 16px;
+  --text-base--line-height: 24px;
+  --text-lg: 18px;
+  --text-lg--line-height: 28px;
+  --text-xl: 20px;
+  --text-xl--line-height: 28px;
+  --text-2xl: 24px;
+  --text-2xl--line-height: 32px;
+  --font-serif: "Hiragino Mincho ProN", "Yu Mincho", "YuMincho", "Noto Serif JP", serif;
+  --font-sans: "Hiragino Kaku Gothic ProN", "Hiragino Sans", system-ui, -apple-system, sans-serif;
+}
+
+:root {
+  color-scheme: light dark;
+  --bg: #faf8f3;
+  --surface: #ffffff;
+  --text: #1f2937;
+  --dim: #6d675c;
+  --border: #ddd5c5;
+  --accent: #1e3a5f;
+  --radius: 10px;
+  --space-surface: var(--surface);
+  --space-surface-alt: var(--surface);
+  --space-muted: var(--dim);
+  --space-border: var(--border);
+  --space-accent: var(--accent);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14161a;
+    --surface: #1e222b;
+    --text: #e8e6e1;
+    --dim: #a39e93;
+    --border: #3a4152;
+    --accent: #8fb4e8;
+  }
+}
+
+/* Print: only the print sheet is visible (formal PDF/print output is
+   generated from the same view definition as the screen table). */
+@media print {
+  body * {
+    visibility: hidden;
+  }
+  #print-sheet,
+  #print-sheet * {
+    visibility: visible;
+  }
+  #print-sheet {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    background: #ffffff;
+    color: #111111;
+  }
+  .no-print {
+    display: none !important;
+  }
+}

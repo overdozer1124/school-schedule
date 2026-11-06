@@ -12,9 +12,13 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { SafeAreaTopScrim } from "@hatch/space-sdk/client";
 import { api, type ApiRequest } from "./api";
 import {
-AUDIENCE_RANK,
+  audienceColumns,
+  audienceItems,
+  audienceRankOf,
+  filterRangeForAudience,
+} from "./audience";
+import {
 LAYOUTS,
-VIS_RANK,
 WEEKDAYS,
 addDays,
 clampColWidth,
@@ -70,8 +74,15 @@ type DragPayload =
 
 type TableCtx = {
   bootstrap: Bootstrap;
+  /** Already filtered for the view's audience (audience.ts). */
   range: RangeData;
+  /** Already filtered for the view's audience (audience.ts). */
   columns: ColumnDef[];
+  /**
+   * Daily items this view may show on any path (calendar symbol band, day
+   * detail…). Never read bootstrap.items for display — it is unfiltered.
+   */
+  items: ItemDef[];
   holidayMap: Map<string, string>;
   onOpenEvent: (e: EventItem) => void;
   onQuickAdd: (
@@ -758,7 +769,7 @@ function DutySelect({
           <option value={`f:${assignment.freeTextName}`}>{assignment.freeTextName}</option>
         )}
       </select>
-      {assignment?.origin === "swap" && (
+      {(assignment?.origin === "swap" || assignment?.origin === "substitute") && (
         <span className="shrink-0 rounded bg-[var(--bg)] px-1 text-[10px] text-[var(--dim)]">
           交代
         </span>
@@ -1286,7 +1297,7 @@ function CalendarGrid({
   const end = addDays(monthEnd(anchor), (7 - endD.getDay()) % 7);
   const days = eachDate(start, end);
   const month = anchor.slice(0, 7);
-  const symbolItems = ctx.bootstrap.items.filter(
+  const symbolItems = ctx.items.filter(
     (i) => i.valueType === "symbol" || i.valueType === "boolean",
   );
   return (
@@ -1729,7 +1740,7 @@ function DayDetailModal({
         </div>
         <h3 className="mb-1 mt-3 text-sm font-bold">日次項目</h3>
         <ul className="text-sm">
-          {ctx.bootstrap.items.map((item) => {
+          {ctx.items.map((item) => {
             const group =
               item.targetGroupId != null
                 ? ctx.bootstrap.targetGroups.find((g) => g.id === item.targetGroupId)
@@ -1756,7 +1767,11 @@ function DayDetailModal({
             <li key={a.id}>
               {ctx.bootstrap.duties.find((d) => d.id === a.dutyDefinitionId)?.name}：
               {personNameOf(ctx.bootstrap.people, a.personId, a.freeTextName)}
-              {a.origin === "swap" && <span className="ml-1 text-xs text-[var(--dim)]">（交代）</span>}
+              {(a.origin === "swap" || a.origin === "substitute") && (
+                <span className="ml-1 text-xs text-[var(--dim)]">
+                  （{a.origin === "substitute" ? "代行" : "交代"}）
+                </span>
+              )}
             </li>
           ))}
         </ul>
@@ -1832,7 +1847,7 @@ function PrintPreview({
     paper = pj.paper ?? "A4";
     orientation = pj.orientation ?? "landscape";
   } catch { /* defaults */ }
-  const printAudienceRank = AUDIENCE_RANK[view?.audience ?? "staff"] ?? 0;
+  const printAudienceRank = audienceRankOf(view?.audience ?? "staff");
   const columns = (() => {
     const fallback = [
       { kind: "category", category: "行事", label: "行事等予定" },
@@ -1847,22 +1862,23 @@ function PrintPreview({
     }
     // Same audience whitelist as the screen table: a guardian/student
     // print never carries staff-only items or duty names.
-    return parsed.filter((c) => {
-      if (c.kind === "daily_item") {
-        const item = bootstrap.items.find((i) => i.id === c.itemId);
-        if (!item) return false;
-        return (VIS_RANK[item.defaultVisibility] ?? 0) >= printAudienceRank;
-      }
-      if (c.kind === "duty") return printAudienceRank === 0;
-      return true;
-    });
+    return audienceColumns(parsed, bootstrap.items, printAudienceRank);
   })();
+  const printItems = audienceItems(bootstrap.items, columns, printAudienceRank);
+  // Re-filter defensively: the print sheet must be safe even if a caller
+  // passes unfiltered range data.
+  const printRange = filterRangeForAudience(
+    range,
+    new Set(printItems.map((i) => i.id)),
+    printAudienceRank,
+  );
   const holidayMap = new Map(bootstrap.holidays.map((h) => [h.date, h.name]));
   const noop = () => undefined;
   const ctx: TableCtx = {
     bootstrap,
-    range,
+    range: printRange,
     columns,
+    items: printItems,
     holidayMap,
     onOpenEvent: noop,
     onQuickAdd: noop,
@@ -1993,19 +2009,15 @@ export function App() {
     return bootstrap.views.find((v) => v.id === viewId) ?? bootstrap.views[0] ?? null;
   }, [bootstrap, viewId]);
 
-  const audienceRank = AUDIENCE_RANK[view?.audience ?? "staff"] ?? 0;
+  const audienceRank = audienceRankOf(view?.audience ?? "staff");
   const columns = useMemo<ColumnDef[]>(() => {
     if (!bootstrap) return [];
-    return parseColumns(view).filter((c) => {
-      if (c.kind === "daily_item") {
-        const item = bootstrap.items.find((i) => i.id === c.itemId);
-        if (!item) return false;
-        return (VIS_RANK[item.defaultVisibility] ?? 0) >= audienceRank;
-      }
-      if (c.kind === "duty") return audienceRank === 0;
-      return true;
-    });
+    return audienceColumns(parseColumns(view), bootstrap.items, audienceRank);
   }, [bootstrap, view, audienceRank]);
+  const viewItems = useMemo<ItemDef[]>(
+    () => (bootstrap ? audienceItems(bootstrap.items, columns, audienceRank) : []),
+    [bootstrap, columns, audienceRank],
+  );
 
   const range = useMemo(() => {
     const schoolYear = (bootstrap?.settings.schoolYear ?? 2026) + yearDelta;
@@ -2038,18 +2050,19 @@ export function App() {
   const rangeData = rangeQ.data;
 
   // Audience filtering (DESIGN §9): a non-staff view only receives events
-  // whose visibility reaches that audience — 職員のみ events never leak
-  // into guardian / student / public views. Staff views see everything.
+  // whose visibility reaches that audience, daily values of the items it
+  // lists, and no duty data — every display path (table, calendar band,
+  // day detail, print) renders from this, never from rangeData directly.
+  // NOTE: this is display filtering only; the server still returns
+  // everything to any caller (server-side authorization is pending).
   const displayRange = useMemo<RangeData | undefined>(() => {
     if (!rangeData) return undefined;
-    if (audienceRank === 0) return rangeData;
-    return {
-      ...rangeData,
-      events: rangeData.events.filter(
-        (e) => (VIS_RANK[e.visibility] ?? 0) >= audienceRank,
-      ),
-    };
-  }, [rangeData, audienceRank]);
+    return filterRangeForAudience(
+      rangeData,
+      new Set(viewItems.map((i) => i.id)),
+      audienceRank,
+    );
+  }, [rangeData, viewItems, audienceRank]);
 
   // Column widths live on the view definition. During a drag only the
   // in-flight preview width is local state; on release the merged map is
@@ -2509,6 +2522,7 @@ export function App() {
     bootstrap,
     range: displayRange ?? emptyRange,
     columns,
+    items: viewItems,
     holidayMap,
     readOnly: scheduleRestricted,
     onOpenEvent: scheduleRestricted ? () => undefined : (e) => setEditingEvent(e),

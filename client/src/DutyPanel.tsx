@@ -1,9 +1,11 @@
 import { useMemo, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "./api";
+import { eventSlot, slotsOverlap } from "../../server/src/logic";
 import {
 ABSENCE_CATEGORIES,
 dayLabel,
+mondayOf,
 slotLabel,
 type Bootstrap,
 type Conflict,
@@ -79,12 +81,22 @@ export function DutyPanel({
   });
 
   const candidatesFor = (c: Conflict): { id: number; name: string }[] => {
+    // Unavailable: absent during this slot (same slot rule as the server's
+    // conflict check), or already holding another duty in an overlapping
+    // slot that day — handing them this one would create a new conflict.
     const absentIds = new Set<number>();
     for (const e of range.events) {
       if (!ABSENCE_CATEGORIES.includes(e.category)) continue;
       if (!e.startsOn || !e.endsOn) continue;
       if (c.date < e.startsOn || c.date > e.endsOn) continue;
+      if (!slotsOverlap(c.slot, eventSlot(e))) continue;
       for (const a of e.assignees) if (a.personId != null) absentIds.add(a.personId);
+    }
+    const monday = mondayOf(c.date);
+    for (const a of range.dutyAssignments) {
+      if (a.personId == null || a.id === c.assignmentId) continue;
+      const onDay = a.slot === "week" ? a.date === monday : a.date === c.date;
+      if (onDay && slotsOverlap(a.slot, c.slot)) absentIds.add(a.personId);
     }
     const def = bootstrap.duties.find((d) => d.id === c.dutyDefinitionId);
     const memberIds = (def?.members ?? [])
@@ -124,7 +136,8 @@ export function DutyPanel({
         dutyDefinitionId: Number(rotDefId),
         from: rotFrom,
         to: rotTo,
-        startIndex: 0,
+        // startIndex omitted: the server resumes after whoever held the
+        // latest assignment before `from`, so the rotation continues.
         skipWeekend,
         skipHoliday,
       });

@@ -3,8 +3,100 @@
 // duty swap/substitute + conflict detection, five standard layouts.
 
 import { defineAction, z, type ActionsModule, type Ctx } from "@hatch/space-sdk";
-import { and, asc, desc, eq, gte, lte } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, lt, lte } from "drizzle-orm";
 import * as schema from "./schema";
+import {
+  dutyAppliesOn,
+  eventSlot,
+  isValidDateString,
+  isValidTimeString,
+  nextRotationIndex,
+  samePerson,
+  slotsOverlap,
+} from "./logic";
+
+// ---------- request validation (DESIGN §2 原則4: reject bad values at the door) ----------
+// Every date / time / enum that reaches the database goes through these, so
+// a malformed value (2026-13-40, an unknown visibility…) is refused instead
+// of being stored and silently skewing range queries, conflicts and totals.
+const dateStr = z
+  .string()
+  .refine(isValidDateString, { message: "日付は YYYY-MM-DD 形式の実在する日付で指定してください" });
+const timeStr = z
+  .string()
+  .refine(isValidTimeString, { message: "時刻は HH:MM 形式で指定してください" });
+const nameStr = z.string().trim().min(1).max(200);
+const shortStr = z.string().max(200);
+const longStr = z.string().max(5000);
+/**
+ * A string that must be one of `values`. Validated at runtime but typed as
+ * plain `string`, so clients keep passing the string state they hold.
+ */
+function oneOf(values: readonly string[]) {
+  return z.string().refine((v) => values.includes(v), {
+    message: `次のいずれかを指定してください：${values.join(" / ")}`,
+  });
+}
+const bit = z.number().int().min(0).max(1);
+const visibilityEnum = oneOf(["staff_only", "guardian", "student", "public"]);
+const certaintyEnum = oneOf(["confirmed", "planned", "tentative", "draft"]);
+const datePrecisionEnum = oneOf(["day", "range", "month", "undecided"]);
+const eventSlotEnum = oneOf(["all_day", "am", "pm"]);
+const dutySlotEnum = oneOf(["all_day", "am", "pm", "week"]);
+const dutyGranularityEnum = oneOf(["day", "am_pm", "week"]);
+const applicablePeriodEnum = oneOf(["all_year", "long_vacation_only", "custom_range"]);
+const valueTypeEnum = oneOf(["text", "time", "time_range", "symbol", "boolean", "number", "person"]);
+const layoutEnum = oneOf([
+  "month_rows",
+  "week_rows",
+  "year_columns",
+  "calendar_grid",
+  "week_timeline",
+  "transposed",
+]);
+const audienceEnum = oneOf(["staff", "guardian", "student", "public"]);
+
+/** A JSON text field whose parsed value must satisfy `ok`. */
+function jsonText(ok: (v: unknown) => boolean, what: string) {
+  return z
+    .string()
+    .max(100_000)
+    .refine(
+      (t) => {
+        try {
+          return ok(JSON.parse(t));
+        } catch {
+          return false;
+        }
+      },
+      { message: `${what}のJSONが正しくありません` },
+    );
+}
+
+/** Refuses a date range whose end precedes its start. */
+function checkRange(from: string | null | undefined, to: string | null | undefined, what: string) {
+  if (from && to && to < from) throw new Error(`${what}の終了日が開始日より前になっています`);
+}
+
+/**
+ * Runs `fn` inside one database transaction (DESIGN §4.7.1: a swap must
+ * never leave one side changed). `fn` receives a Ctx whose `db()` is the
+ * transaction, so shared helpers that call `ctx.db()` join it unchanged.
+ * Call `ctx.invalidateQueries()` after this returns, i.e. after commit.
+ */
+async function inTransaction<T>(ctx: Ctx, fn: (tctx: Ctx) => Promise<T>): Promise<T> {
+  const db = ctx.db<typeof schema>();
+  return db.transaction(async (tx) => {
+    const tctx = new Proxy(ctx, {
+      get(target, prop) {
+        if (prop === "db") return () => tx;
+        const v = Reflect.get(target, prop, target) as unknown;
+        return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      },
+    });
+    return fn(tctx);
+  });
+}
 
 
 // ---------- date helpers (calendar dates as YYYY-MM-DD text) ----------
@@ -293,12 +385,6 @@ async function loadEvents(ctx: Ctx, from: string, to: string) {
   }));
 }
 
-function slotsOverlap(a: string, b: string): boolean {
-  if (a === "week" || b === "week") return true;
-  if (a === "all_day" || b === "all_day") return true;
-  return a === b;
-}
-
 async function computeConflicts(
   ctx: Ctx,
   from: string,
@@ -329,20 +415,27 @@ async function computeConflicts(
   const effDates = (a: { date: string; slot: string }): string[] =>
     a.slot === "week" ? eachDate(a.date, addDays(a.date, 6)) : [a.date];
 
-  // absence overlap + double assignment
+  const holderName = (x: { personId: number | null; freeTextName: string | null }) =>
+    (x.personId != null ? personName.get(x.personId) : undefined) ?? x.freeTextName ?? "";
+
+  // absence overlap + double assignment. Holders are matched by id when
+  // both sides are registered and by name otherwise, so free-text holders
+  // (未登録の非常勤など) are checked too (DESIGN §4.5).
   for (const a of assignments) {
-    if (a.personId == null) continue;
-    const name =
-      personName.get(a.personId) ?? a.freeTextName ?? "";
+    const name = holderName(a);
+    if (a.personId == null && name === "") continue;
+    const holder = { personId: a.personId, name };
     for (const d of effDates(a)) {
       if (d < from || d > to) continue;
       for (const e of absenceEvents) {
         if (!e.startsOn || !e.endsOn) continue;
         if (d < e.startsOn || d > e.endsOn) continue;
-        const hasPerson = e.assignees.some((x) => x.personId === a.personId);
+        const hasPerson = e.assignees.some((x) =>
+          samePerson(holder, { personId: x.personId, name: holderName(x) }),
+        );
         if (!hasPerson) continue;
-        const evSlot = e.isAllDay === 1 ? e.slot : "all_day";
-        if (!slotsOverlap(a.slot, evSlot)) continue;
+        // Partial-day absences only clash with the matching half (§4.7.2).
+        if (!slotsOverlap(a.slot, eventSlot(e))) continue;
         if (waived.has(`${a.id}:${e.id}`)) continue;
         out.push({
           kind: "absence",
@@ -364,7 +457,10 @@ async function computeConflicts(
     for (let j = i + 1; j < assignments.length; j++) {
       const a = assignments[i]!;
       const b = assignments[j]!;
-      if (a.personId == null || a.personId !== b.personId) continue;
+      const an = holderName(a);
+      if (a.personId == null && an === "") continue;
+      if (!samePerson({ personId: a.personId, name: an }, { personId: b.personId, name: holderName(b) }))
+        continue;
       for (const d of effDates(a)) {
         if (d < from || d > to) continue;
         if (!effDates(b).includes(d)) continue;
@@ -380,7 +476,7 @@ async function computeConflicts(
           date: d,
           slot: a.slot,
           personId: a.personId,
-          personName: personName.get(a.personId) ?? "",
+          personName: an,
           eventId: null,
           eventTitle: "当番の二重割当",
         });
@@ -389,12 +485,7 @@ async function computeConflicts(
   }
   // unassigned slots
   for (const def of defs) {
-    const applies = (d: string): boolean => {
-      if (def.applicablePeriod === "all_year") return true;
-      if (def.startsOn && d < def.startsOn) return false;
-      if (def.endsOn && d > def.endsOn) return false;
-      return true;
-    };
+    const applies = (d: string): boolean => dutyAppliesOn(def, d);
     const slots =
       def.granularity === "am_pm"
         ? ["am", "pm"]
@@ -736,38 +827,56 @@ async function applyPresetData(
 }
 
 const okResponse = z.object({ ok: z.literal(true) });
+// Display ranges: at most ~400 days (one school year plus margin).
+const rangeRequest = z
+  .object({ from: dateStr, to: dateStr })
+  .refine((r) => r.from <= r.to, { message: "期間の終了日が開始日より前になっています" });
 const idResponse = z.object({ id: z.number() });
 
-const eventInput = z.object({
-  title: z.string().min(1),
-  category: z.string().default("行事"),
-  datePrecision: z.string().default("day"),
-  startsOn: z.string().nullable().default(null),
-  endsOn: z.string().nullable().default(null),
-  startsAt: z.string().nullable().default(null),
-  endsAt: z.string().nullable().default(null),
-  isAllDay: z.number().default(1),
-  slot: z.string().default("all_day"),
-  periodFrom: z.number().nullable().default(null),
-  periodTo: z.number().nullable().default(null),
+const eventFields = z.object({
+  title: nameStr,
+  category: shortStr.trim().min(1).default("行事"),
+  datePrecision: datePrecisionEnum.default("day"),
+  startsOn: dateStr.nullable().default(null),
+  endsOn: dateStr.nullable().default(null),
+  startsAt: timeStr.nullable().default(null),
+  endsAt: timeStr.nullable().default(null),
+  isAllDay: bit.default(1),
+  slot: eventSlotEnum.default("all_day"),
+  periodFrom: z.number().int().min(0).max(20).nullable().default(null),
+  periodTo: z.number().int().min(0).max(20).nullable().default(null),
   locationId: z.number().nullable().default(null),
-  locationText: z.string().nullable().default(null),
-  leaveType: z.string().nullable().default(null),
-  description: z.string().default(""),
-  certainty: z.string().default("confirmed"),
-  visibility: z.string().default("staff_only"),
-  submitTo: z.string().nullable().default(null),
+  locationText: shortStr.nullable().default(null),
+  leaveType: shortStr.nullable().default(null),
+  description: longStr.default(""),
+  certainty: certaintyEnum.default("confirmed"),
+  visibility: visibilityEnum.default("staff_only"),
+  submitTo: shortStr.nullable().default(null),
   assignees: z
     .array(
       z.object({
         personId: z.number().nullable().default(null),
-        freeTextName: z.string().nullable().default(null),
-        role: z.string().default("担当"),
+        freeTextName: shortStr.nullable().default(null),
+        role: shortStr.default("担当"),
       }),
     )
+    .max(100)
     .default([]),
-  targetIds: z.array(z.number()).default([]),
+  targetIds: z.array(z.number()).max(500).default([]),
 });
+type EventFields = z.infer<typeof eventFields>;
+function checkEventFields(e: EventFields, ctx: z.RefinementCtx<EventFields>) {
+  if (e.startsOn && e.endsOn && e.endsOn < e.startsOn)
+    ctx.addIssue({ code: "custom", path: ["endsOn"], message: "終了日が開始日より前になっています" });
+  if ((e.datePrecision === "day" || e.datePrecision === "range") && !e.startsOn)
+    ctx.addIssue({ code: "custom", path: ["startsOn"], message: "日付が確定した予定には開始日が必要です" });
+  if (e.isAllDay === 0 && e.startsAt && e.endsAt && e.endsAt < e.startsAt && (!e.endsOn || e.endsOn === e.startsOn))
+    ctx.addIssue({ code: "custom", path: ["endsAt"], message: "終了時刻が開始時刻より前になっています" });
+  if (e.periodFrom != null && e.periodTo != null && e.periodTo < e.periodFrom)
+    ctx.addIssue({ code: "custom", path: ["periodTo"], message: "終了時限が開始時限より前になっています" });
+}
+const eventInput = eventFields.superRefine(checkEventFields);
+const eventUpdateInput = eventFields.extend({ id: z.number() }).superRefine(checkEventFields);
 
 async function replaceEventChildren(
   ctx: Ctx,
@@ -788,6 +897,49 @@ async function replaceEventChildren(
   }
   for (const t of args.targetIds) {
     await db.insert(schema.eventTargets).values({ eventId, targetId: t });
+  }
+}
+
+/** Refuses to delete a target that daily values or events still refer to. */
+async function assertTargetUnused(ctx: Ctx, targetId: number, name: string) {
+  const db = ctx.db<typeof schema>();
+  const dv = await db
+    .select({ id: schema.dailyValues.id })
+    .from(schema.dailyValues)
+    .where(eq(schema.dailyValues.targetId, targetId))
+    .limit(1);
+  const et = await db
+    .select({ id: schema.eventTargets.id })
+    .from(schema.eventTargets)
+    .where(eq(schema.eventTargets.targetId, targetId))
+    .limit(1);
+  if (dv.length > 0 || et.length > 0)
+    throw new Error(
+      `対象「${name}」は入力済みの日次値または予定で使われているため削除できません。先に該当する値・予定の対象を変更してください。`,
+    );
+}
+
+/** Removes columns matching `drop` from every view definition's columns_json. */
+async function dropViewColumns(
+  ctx: Ctx,
+  drop: (c: { kind?: unknown; itemId?: unknown; dutyId?: unknown }) => boolean,
+) {
+  const db = ctx.db<typeof schema>();
+  const views = await db.select().from(schema.viewDefinitions);
+  for (const v of views) {
+    let cols: unknown;
+    try {
+      cols = JSON.parse(v.columnsJson);
+    } catch {
+      continue;
+    }
+    if (!Array.isArray(cols)) continue;
+    const kept = cols.filter((c) => !(c && typeof c === "object" && drop(c as Record<string, unknown>)));
+    if (kept.length !== cols.length)
+      await db
+        .update(schema.viewDefinitions)
+        .set({ columnsJson: JSON.stringify(kept) })
+        .where(eq(schema.viewDefinitions.id, v.id));
   }
 }
 
@@ -1013,7 +1165,7 @@ export const Actions = {
   getRange: defineAction({
     description:
       "Loads events, daily values, duty assignments, day records, derived duty conflicts, and duty change history for a date range.",
-    request: z.object({ from: z.string(), to: z.string() }),
+    request: rangeRequest,
     response: z.object({
       events: z.array(eventShape),
       dailyValues: z.array(
@@ -1138,7 +1290,7 @@ export const Actions = {
   getSummary: defineAction({
     description:
       "Derives period totals for a date range (DESIGN §8): school-day counts by day type (explicit day records win; otherwise weekends and registered holidays count as 休業日 and other days as 授業日), and for every aggregatable item the number of days whose symbol counts (item_options.counts_as), with a per-target breakdown. Nothing is stored; everything is derived from day records and daily values.",
-    request: z.object({ from: z.string(), to: z.string() }),
+    request: rangeRequest,
     response: z.object({
       schoolDays: z.number(),
       dayTypeCounts: z.array(
@@ -1218,25 +1370,31 @@ export const Actions = {
           ),
         );
       const items = itemRows.map((item) => {
-        const byTargetMap = new Map<number | null, number>();
-        let total = 0;
+        // Counts are numbers of distinct days (DESIGN §8): total is the days
+        // on which the symbol counts for at least one target, and each
+        // target's count is its own days — so a per-grade item is not
+        // multiplied by the number of grades, nor am/pm rows counted twice.
+        const allDays = new Set<string>();
+        const byTargetMap = new Map<number | null, Set<string>>();
         for (const d of daily) {
           if (d.itemDefinitionId !== item.id) continue;
           if (d.valueOptionId == null || !countsAsOptionIds.has(d.valueOptionId))
             continue;
-          total++;
+          allDays.add(d.date);
           const key = d.targetId ?? null;
-          byTargetMap.set(key, (byTargetMap.get(key) ?? 0) + 1);
+          const set = byTargetMap.get(key) ?? new Set<string>();
+          set.add(d.date);
+          byTargetMap.set(key, set);
         }
         return {
           itemId: item.id,
           name: item.name,
-          total,
-          byTarget: [...byTargetMap.entries()].map(([targetId, count]) => ({
+          total: allDays.size,
+          byTarget: [...byTargetMap.entries()].map(([targetId, days]) => ({
             targetId,
             targetName:
               targetId != null ? (targetName.get(targetId) ?? "") : "全体",
-            count,
+            count: days.size,
           })),
         };
       });
@@ -1250,7 +1408,7 @@ export const Actions = {
 
   saveSettings: defineAction({
     description: "Saves the school name and current school year.",
-    request: z.object({ schoolName: z.string(), schoolYear: z.number().int() }),
+    request: z.object({ schoolName: shortStr, schoolYear: z.number().int().min(2000).max(2100) }),
     response: okResponse,
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
       const db = ctx.db<typeof schema>();
@@ -1300,15 +1458,18 @@ export const Actions = {
     }),
     response: okResponse,
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
-      const db = ctx.db<typeof schema>();
-      await loadSettings(ctx);
-      await applyPresetData(ctx, args.preset);
+      const result = await inTransaction(ctx, async (tctx) => {
+      const db = tctx.db<typeof schema>();
+      await loadSettings(tctx);
+      await applyPresetData(tctx, args.preset);
       await db
         .update(schema.settings)
         .set({ presetApplied: args.preset })
         .where(eq(schema.settings.id, 1));
-      ctx.invalidateQueries();
       return { ok: true as const };
+      });
+      ctx.invalidateQueries();
+      return result;
     },
   }),
 
@@ -1316,8 +1477,8 @@ export const Actions = {
     description: "Creates or updates a person (staff member) in the master list.",
     request: z.object({
       id: z.number().nullable().default(null),
-      name: z.string().min(1),
-      role: z.string().default(""),
+      name: nameStr,
+      role: shortStr.default(""),
       sort: z.number().default(0),
     }),
     response: idResponse,
@@ -1341,12 +1502,33 @@ export const Actions = {
   }),
 
   deletePerson: defineAction({
-    description: "Deletes a person from the master list.",
+    description:
+      "Deletes a person from the master list. References are kept readable instead of left dangling: event assignees, duty assignments and rotation members switch to the person's name as free text (so displays and name-based conflict checks keep working), and person-type daily values keep the name as text.",
     request: z.object({ id: z.number() }),
     response: okResponse,
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
-      const db = ctx.db<typeof schema>();
-      await db.delete(schema.people).where(eq(schema.people.id, args.id));
+      await inTransaction(ctx, async (tctx) => {
+        const db = tctx.db<typeof schema>();
+        const [p] = await db.select().from(schema.people).where(eq(schema.people.id, args.id)).limit(1);
+        if (!p) return;
+        await db
+          .update(schema.eventAssignees)
+          .set({ personId: null, freeTextName: p.name })
+          .where(eq(schema.eventAssignees.personId, p.id));
+        await db
+          .update(schema.dutyAssignments)
+          .set({ personId: null, freeTextName: p.name })
+          .where(eq(schema.dutyAssignments.personId, p.id));
+        await db
+          .update(schema.rotationMembers)
+          .set({ personId: null, freeTextName: p.name })
+          .where(eq(schema.rotationMembers.personId, p.id));
+        await db
+          .update(schema.dailyValues)
+          .set({ valuePersonId: null, valueText: p.name })
+          .where(eq(schema.dailyValues.valuePersonId, p.id));
+        await db.delete(schema.people).where(eq(schema.people.id, p.id));
+      });
       ctx.invalidateQueries();
       return { ok: true as const };
     },
@@ -1356,8 +1538,8 @@ export const Actions = {
     description: "Creates or updates a registered location.",
     request: z.object({
       id: z.number().nullable().default(null),
-      name: z.string().min(1),
-      kind: z.string().default(""),
+      name: nameStr,
+      kind: shortStr.default(""),
       sort: z.number().default(0),
     }),
     response: idResponse,
@@ -1381,12 +1563,27 @@ export const Actions = {
   }),
 
   deleteLocation: defineAction({
-    description: "Deletes a registered location.",
+    description:
+      "Deletes a registered location. Events that used it keep the location name as free text, so nothing silently disappears from the schedule.",
     request: z.object({ id: z.number() }),
     response: okResponse,
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
-      const db = ctx.db<typeof schema>();
-      await db.delete(schema.locations).where(eq(schema.locations.id, args.id));
+      await inTransaction(ctx, async (tctx) => {
+        const db = tctx.db<typeof schema>();
+        const [loc] = await db.select().from(schema.locations).where(eq(schema.locations.id, args.id)).limit(1);
+        if (!loc) return;
+        const evs = await db
+          .select({ id: schema.events.id, locationText: schema.events.locationText })
+          .from(schema.events)
+          .where(eq(schema.events.locationId, loc.id));
+        for (const e of evs) {
+          await db
+            .update(schema.events)
+            .set({ locationId: null, locationText: e.locationText?.trim() ? e.locationText : loc.name })
+            .where(eq(schema.events.id, e.id));
+        }
+        await db.delete(schema.locations).where(eq(schema.locations.id, loc.id));
+      });
       ctx.invalidateQueries();
       return { ok: true as const };
     },
@@ -1396,9 +1593,9 @@ export const Actions = {
     description: "Creates or updates a holiday / school closure day.",
     request: z.object({
       id: z.number().nullable().default(null),
-      date: z.string(),
-      name: z.string().min(1),
-      kind: z.string().default("祝日"),
+      date: dateStr,
+      name: nameStr,
+      kind: shortStr.default("祝日"),
     }),
     response: idResponse,
     async handler(ctx, args) {
@@ -1436,9 +1633,9 @@ export const Actions = {
     description: "Creates or updates a target group (axis such as grades, clubs, bus routes).",
     request: z.object({
       id: z.number().nullable().default(null),
-      key: z.string().min(1),
-      name: z.string().min(1),
-      sort: z.number().default(0),
+      key: z.string().trim().min(1).max(64),
+      name: nameStr,
+      sort: z.number().int().default(0),
     }),
     response: idResponse,
     async handler(ctx, args) {
@@ -1461,13 +1658,26 @@ export const Actions = {
   }),
 
   deleteTargetGroup: defineAction({
-    description: "Deletes a target group and its targets.",
+    description:
+      "Deletes a target group and its targets. Refused while an item definition is split by this group or any of its targets still has daily values or event links, so per-target data is never orphaned.",
     request: z.object({ id: z.number() }),
     response: okResponse,
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
-      const db = ctx.db<typeof schema>();
-      await db.delete(schema.targets).where(eq(schema.targets.groupId, args.id));
-      await db.delete(schema.targetGroups).where(eq(schema.targetGroups.id, args.id));
+      await inTransaction(ctx, async (tctx) => {
+        const db = tctx.db<typeof schema>();
+        const items = await db
+          .select({ name: schema.itemDefinitions.name })
+          .from(schema.itemDefinitions)
+          .where(eq(schema.itemDefinitions.targetGroupId, args.id));
+        if (items.length > 0)
+          throw new Error(
+            `項目${items.map((i) => `「${i.name}」`).join("")}がこの対象軸で分けられているため削除できません。先に項目の対象軸を変更してください。`,
+          );
+        const ts = await db.select().from(schema.targets).where(eq(schema.targets.groupId, args.id));
+        for (const t of ts) await assertTargetUnused(tctx, t.id, t.name);
+        await db.delete(schema.targets).where(eq(schema.targets.groupId, args.id));
+        await db.delete(schema.targetGroups).where(eq(schema.targetGroups.id, args.id));
+      });
       ctx.invalidateQueries();
       return { ok: true as const };
     },
@@ -1478,7 +1688,7 @@ export const Actions = {
     request: z.object({
       id: z.number().nullable().default(null),
       groupId: z.number(),
-      name: z.string().min(1),
+      name: nameStr,
       sort: z.number().default(0),
     }),
     response: idResponse,
@@ -1502,12 +1712,18 @@ export const Actions = {
   }),
 
   deleteTarget: defineAction({
-    description: "Deletes a target.",
+    description:
+      "Deletes a target. Refused while daily values or events still refer to it (DESIGN §4.8.2 keeps values per target; deleting would orphan them).",
     request: z.object({ id: z.number() }),
     response: okResponse,
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
-      const db = ctx.db<typeof schema>();
-      await db.delete(schema.targets).where(eq(schema.targets.id, args.id));
+      await inTransaction(ctx, async (tctx) => {
+        const db = tctx.db<typeof schema>();
+        const [t] = await db.select().from(schema.targets).where(eq(schema.targets.id, args.id)).limit(1);
+        if (!t) return;
+        await assertTargetUnused(tctx, t.id, t.name);
+        await db.delete(schema.targets).where(eq(schema.targets.id, t.id));
+      });
       ctx.invalidateQueries();
       return { ok: true as const };
     },
@@ -1515,90 +1731,115 @@ export const Actions = {
 
   upsertItemDefinition: defineAction({
     description:
-      "Creates or updates an item definition (a customizable column) together with its symbol/code options.",
+      "Creates or updates an item definition (a customizable column) together with its symbol/code options. Options are diffed by code: an existing code keeps its option id (so stored daily values keep pointing at it), new codes are added, and a removed code is refused while daily values still use it.",
     request: z.object({
       id: z.number().nullable().default(null),
-      key: z.string().min(1),
-      name: z.string().min(1),
-      valueType: z.string().default("text"),
+      key: z.string().trim().min(1).max(64),
+      name: nameStr,
+      valueType: valueTypeEnum.default("text"),
       targetGroupId: z.number().nullable().default(null),
-      granularity: z.string().default("day"),
-      defaultVisibility: z.string().default("staff_only"),
-      isAggregatable: z.number().default(0),
-      sort: z.number().default(0),
+      granularity: oneOf(["day"]).default("day"),
+      defaultVisibility: visibilityEnum.default("staff_only"),
+      isAggregatable: bit.default(0),
+      sort: z.number().int().default(0),
       options: z
         .array(
           z.object({
-            code: z.string(),
-            label: z.string(),
-            meaning: z.string().default(""),
-            countsAs: z.number().default(0),
+            code: z.string().trim().min(1).max(20),
+            label: shortStr,
+            meaning: shortStr.default(""),
+            countsAs: bit.default(0),
           }),
         )
+        .max(100)
         .default([]),
     }),
     response: idResponse,
     async handler(ctx, args) {
-      const db = ctx.db<typeof schema>();
-      let id = args.id;
-      if (id != null) {
-        await db
-          .update(schema.itemDefinitions)
-          .set({
-            key: args.key,
-            name: args.name,
-            valueType: args.valueType,
-            targetGroupId: args.targetGroupId,
-            granularity: args.granularity,
-            defaultVisibility: args.defaultVisibility,
-            isAggregatable: args.isAggregatable,
-            sort: args.sort,
-          })
-          .where(eq(schema.itemDefinitions.id, id));
-      } else {
-        const [row] = await db
-          .insert(schema.itemDefinitions)
-          .values({
-            key: args.key,
-            name: args.name,
-            valueType: args.valueType,
-            targetGroupId: args.targetGroupId,
-            granularity: args.granularity,
-            defaultVisibility: args.defaultVisibility,
-            isAggregatable: args.isAggregatable,
-            sort: args.sort,
-          })
-          .returning({ id: schema.itemDefinitions.id });
-        id = row!.id;
-      }
-      await db
-        .delete(schema.itemOptions)
-        .where(eq(schema.itemOptions.itemDefinitionId, id));
-      for (let i = 0; i < args.options.length; i++) {
-        const o = args.options[i]!;
-        await db.insert(schema.itemOptions).values({
-          itemDefinitionId: id,
-          code: o.code,
-          label: o.label,
-          meaning: o.meaning,
-          countsAs: o.countsAs,
-          sort: i,
-        });
-      }
+      const codes = args.options.map((o) => o.code);
+      const dup = codes.find((c, i) => codes.indexOf(c) !== i);
+      if (dup != null) throw new Error(`記号「${dup}」が重複しています`);
+      const id = await inTransaction(ctx, async (tctx) => {
+        const db = tctx.db<typeof schema>();
+        const fields = {
+          key: args.key,
+          name: args.name,
+          valueType: args.valueType,
+          targetGroupId: args.targetGroupId,
+          granularity: args.granularity,
+          defaultVisibility: args.defaultVisibility,
+          isAggregatable: args.isAggregatable,
+          sort: args.sort,
+        };
+        let id = args.id;
+        if (id != null) {
+          const [cur] = await db
+            .select({ id: schema.itemDefinitions.id })
+            .from(schema.itemDefinitions)
+            .where(eq(schema.itemDefinitions.id, id))
+            .limit(1);
+          if (!cur) throw new Error("更新対象の項目が見つかりません");
+          await db.update(schema.itemDefinitions).set(fields).where(eq(schema.itemDefinitions.id, id));
+        } else {
+          const [row] = await db
+            .insert(schema.itemDefinitions)
+            .values(fields)
+            .returning({ id: schema.itemDefinitions.id });
+          id = row!.id;
+        }
+        const existing = await db
+          .select()
+          .from(schema.itemOptions)
+          .where(eq(schema.itemOptions.itemDefinitionId, id));
+        const byCode = new Map(existing.map((o) => [o.code, o]));
+        // Removed codes: refuse while any daily value still points at them,
+        // otherwise those cells would silently lose their symbol and totals.
+        const removed = existing.filter((o) => !codes.includes(o.code));
+        if (removed.length > 0) {
+          const used = await db
+            .select({ optionId: schema.dailyValues.valueOptionId })
+            .from(schema.dailyValues)
+            .where(inArray(schema.dailyValues.valueOptionId, removed.map((o) => o.id)));
+          if (used.length > 0) {
+            const inUse = removed
+              .filter((o) => used.some((u) => u.optionId === o.id))
+              .map((o) => `「${o.code}」`)
+              .join("");
+            throw new Error(
+              `記号${inUse}は入力済みの日次値（${used.length}件）で使われているため削除できません。先に該当日の値を変更してください。`,
+            );
+          }
+          await db.delete(schema.itemOptions).where(inArray(schema.itemOptions.id, removed.map((o) => o.id)));
+        }
+        for (let i = 0; i < args.options.length; i++) {
+          const o = args.options[i]!;
+          const cur = byCode.get(o.code);
+          const values = { label: o.label, meaning: o.meaning, countsAs: o.countsAs, sort: i };
+          if (cur) {
+            await db.update(schema.itemOptions).set(values).where(eq(schema.itemOptions.id, cur.id));
+          } else {
+            await db.insert(schema.itemOptions).values({ itemDefinitionId: id, code: o.code, ...values });
+          }
+        }
+        return id;
+      });
       ctx.invalidateQueries();
       return { id };
     },
   }),
 
   deleteItemDefinition: defineAction({
-    description: "Deletes an item definition, its options, and its daily values.",
+    description: "Deletes an item definition, its options, its daily values, and its columns in view definitions.",
     request: z.object({ id: z.number() }),
     response: okResponse,
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
-      const db = ctx.db<typeof schema>();
-      await db.delete(schema.dailyValues).where(eq(schema.dailyValues.itemDefinitionId, args.id));
-      await db.delete(schema.itemOptions).where(eq(schema.itemOptions.itemDefinitionId, args.id));
-      await db.delete(schema.itemDefinitions).where(eq(schema.itemDefinitions.id, args.id));
+      await inTransaction(ctx, async (tctx) => {
+        const db = tctx.db<typeof schema>();
+        await db.delete(schema.dailyValues).where(eq(schema.dailyValues.itemDefinitionId, args.id));
+        await db.delete(schema.itemOptions).where(eq(schema.itemOptions.itemDefinitionId, args.id));
+        await db.delete(schema.itemDefinitions).where(eq(schema.itemDefinitions.id, args.id));
+        await dropViewColumns(tctx, (c) => c.kind === "daily_item" && c.itemId === args.id);
+      });
       ctx.invalidateQueries();
       return { ok: true as const };
     },
@@ -1608,23 +1849,25 @@ export const Actions = {
     description: "Creates or updates a period pattern (day schedule) with its period rows.",
     request: z.object({
       id: z.number().nullable().default(null),
-      code: z.string().min(1),
-      name: z.string().min(1),
-      sort: z.number().default(0),
+      code: z.string().trim().min(1).max(64),
+      name: nameStr,
+      sort: z.number().int().default(0),
       periods: z
         .array(
           z.object({
-            periodNo: z.number(),
-            label: z.string(),
-            startsAt: z.string().nullable().default(null),
-            endsAt: z.string().nullable().default(null),
+            periodNo: z.number().int().min(0).max(99),
+            label: shortStr,
+            startsAt: timeStr.nullable().default(null),
+            endsAt: timeStr.nullable().default(null),
           }),
         )
+        .max(30)
         .default([]),
     }),
     response: idResponse,
     async handler(ctx, args) {
-      const db = ctx.db<typeof schema>();
+      const result = await inTransaction(ctx, async (tctx) => {
+      const db = tctx.db<typeof schema>();
       let id = args.id;
       if (id != null) {
         await db
@@ -1650,19 +1893,27 @@ export const Actions = {
           sort: i,
         });
       }
-      ctx.invalidateQueries();
       return { id };
+      });
+      ctx.invalidateQueries();
+      return result;
     },
   }),
 
   deletePeriodPattern: defineAction({
-    description: "Deletes a period pattern and its periods.",
+    description: "Deletes a period pattern and its periods. Day records that used it fall back to no pattern.",
     request: z.object({ id: z.number() }),
     response: okResponse,
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
-      const db = ctx.db<typeof schema>();
-      await db.delete(schema.periodDefinitions).where(eq(schema.periodDefinitions.patternId, args.id));
-      await db.delete(schema.periodPatterns).where(eq(schema.periodPatterns.id, args.id));
+      await inTransaction(ctx, async (tctx) => {
+        const db = tctx.db<typeof schema>();
+        await db
+          .update(schema.dayRecords)
+          .set({ periodPatternId: null })
+          .where(eq(schema.dayRecords.periodPatternId, args.id));
+        await db.delete(schema.periodDefinitions).where(eq(schema.periodDefinitions.patternId, args.id));
+        await db.delete(schema.periodPatterns).where(eq(schema.periodPatterns.id, args.id));
+      });
       ctx.invalidateQueries();
       return { ok: true as const };
     },
@@ -1673,17 +1924,19 @@ export const Actions = {
       "Creates or updates a duty definition (granularity day / am_pm / week, applicable period including long-vacation-only) and replaces its rotation member order.",
     request: z.object({
       id: z.number().nullable().default(null),
-      name: z.string().min(1),
-      granularity: z.string().default("day"),
-      applicablePeriod: z.string().default("all_year"),
-      startsOn: z.string().nullable().default(null),
-      endsOn: z.string().nullable().default(null),
-      sort: z.number().default(0),
-      memberPersonIds: z.array(z.number()).default([]),
+      name: nameStr,
+      granularity: dutyGranularityEnum.default("day"),
+      applicablePeriod: applicablePeriodEnum.default("all_year"),
+      startsOn: dateStr.nullable().default(null),
+      endsOn: dateStr.nullable().default(null),
+      sort: z.number().int().default(0),
+      memberPersonIds: z.array(z.number()).max(500).default([]),
     }),
     response: idResponse,
     async handler(ctx, args) {
-      const db = ctx.db<typeof schema>();
+      checkRange(args.startsOn, args.endsOn, "当番の適用期間");
+      const result = await inTransaction(ctx, async (tctx) => {
+      const db = tctx.db<typeof schema>();
       let id = args.id;
       if (id != null) {
         await db
@@ -1719,20 +1972,35 @@ export const Actions = {
           sort: i,
         });
       }
-      ctx.invalidateQueries();
       return { id };
+      });
+      ctx.invalidateQueries();
+      return result;
     },
   }),
 
   deleteDutyDefinition: defineAction({
-    description: "Deletes a duty definition, its rotation members, and its assignments.",
+    description:
+      "Deletes a duty definition together with everything that only exists for it: rotation members, assignments, their conflict waivers, its change history, and its columns in view definitions.",
     request: z.object({ id: z.number() }),
     response: okResponse,
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
-      const db = ctx.db<typeof schema>();
-      await db.delete(schema.dutyAssignments).where(eq(schema.dutyAssignments.dutyDefinitionId, args.id));
-      await db.delete(schema.rotationMembers).where(eq(schema.rotationMembers.dutyDefinitionId, args.id));
-      await db.delete(schema.dutyDefinitions).where(eq(schema.dutyDefinitions.id, args.id));
+      await inTransaction(ctx, async (tctx) => {
+        const db = tctx.db<typeof schema>();
+        const asg = await db
+          .select({ id: schema.dutyAssignments.id })
+          .from(schema.dutyAssignments)
+          .where(eq(schema.dutyAssignments.dutyDefinitionId, args.id));
+        if (asg.length > 0)
+          await db
+            .delete(schema.dutyConflictWaivers)
+            .where(inArray(schema.dutyConflictWaivers.assignmentId, asg.map((a) => a.id)));
+        await db.delete(schema.dutyChanges).where(eq(schema.dutyChanges.dutyDefinitionId, args.id));
+        await db.delete(schema.dutyAssignments).where(eq(schema.dutyAssignments.dutyDefinitionId, args.id));
+        await db.delete(schema.rotationMembers).where(eq(schema.rotationMembers.dutyDefinitionId, args.id));
+        await db.delete(schema.dutyDefinitions).where(eq(schema.dutyDefinitions.id, args.id));
+        await dropViewColumns(tctx, (c) => c.kind === "duty" && c.dutyId === args.id);
+      });
       ctx.invalidateQueries();
       return { ok: true as const };
     },
@@ -1743,7 +2011,8 @@ export const Actions = {
     request: eventInput,
     response: idResponse,
     async handler(ctx, args) {
-      const db = ctx.db<typeof schema>();
+      const id = await inTransaction(ctx, async (tctx) => {
+      const db = tctx.db<typeof schema>();
       const [row] = await db
         .insert(schema.events)
         .values({
@@ -1767,18 +2036,21 @@ export const Actions = {
           submitTo: args.submitTo,
         })
         .returning({ id: schema.events.id });
-      await replaceEventChildren(ctx, row!.id, args);
+      await replaceEventChildren(tctx, row!.id, args);
+      return row!.id;
+      });
       ctx.invalidateQueries();
-      return { id: row!.id };
+      return { id };
     },
   }),
 
   updateEvent: defineAction({
     description: "Updates an event and its assignees / targets.",
-    request: eventInput.extend({ id: z.number() }),
+    request: eventUpdateInput,
     response: okResponse,
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
-      const db = ctx.db<typeof schema>();
+      await inTransaction(ctx, async (tctx) => {
+      const db = tctx.db<typeof schema>();
       await db
         .update(schema.events)
         .set({
@@ -1802,7 +2074,8 @@ export const Actions = {
           submitTo: args.submitTo,
         })
         .where(eq(schema.events.id, args.id));
-      await replaceEventChildren(ctx, args.id, args);
+      await replaceEventChildren(tctx, args.id, args);
+      });
       ctx.invalidateQueries();
       return { ok: true as const };
     },
@@ -1813,11 +2086,13 @@ export const Actions = {
     request: z.object({ id: z.number() }),
     response: okResponse,
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
-      const db = ctx.db<typeof schema>();
-      await db.delete(schema.eventAssignees).where(eq(schema.eventAssignees.eventId, args.id));
-      await db.delete(schema.eventTargets).where(eq(schema.eventTargets.eventId, args.id));
-      await db.delete(schema.dutyConflictWaivers).where(eq(schema.dutyConflictWaivers.eventId, args.id));
-      await db.delete(schema.events).where(eq(schema.events.id, args.id));
+      await inTransaction(ctx, async (tctx) => {
+        const db = tctx.db<typeof schema>();
+        await db.delete(schema.eventAssignees).where(eq(schema.eventAssignees.eventId, args.id));
+        await db.delete(schema.eventTargets).where(eq(schema.eventTargets.eventId, args.id));
+        await db.delete(schema.dutyConflictWaivers).where(eq(schema.dutyConflictWaivers.eventId, args.id));
+        await db.delete(schema.events).where(eq(schema.events.id, args.id));
+      });
       ctx.invalidateQueries();
       return { ok: true as const };
     },
@@ -1828,9 +2103,9 @@ export const Actions = {
       "Moves an event to a different date by drag-and-drop. A single-day event lands on the target date; a multi-day (range) event shifts as a whole by the distance between the grabbed day (sourceDate) and the target date, preserving its length. Month-only / undecided events become day events on the target date. When targetCategory is given and differs, the event's category changes to the dropped column's category. Times, assignees and all other fields are preserved.",
     request: z.object({
       id: z.number(),
-      targetDate: z.string(),
-      sourceDate: z.string().nullable().default(null),
-      targetCategory: z.string().nullable().default(null),
+      targetDate: dateStr,
+      sourceDate: dateStr.nullable().default(null),
+      targetCategory: shortStr.trim().min(1).nullable().default(null),
     }),
     response: okResponse,
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
@@ -1889,13 +2164,14 @@ export const Actions = {
       "Moves all daily values for one item definition from one date to another (drag-and-drop of a daily cell such as 下校時刻 or 給食). Every target/slot row for that item on the source date moves; rows already on the destination for the same item/target/slot are replaced.",
     request: z.object({
       itemDefinitionId: z.number(),
-      fromDate: z.string(),
-      toDate: z.string(),
+      fromDate: dateStr,
+      toDate: dateStr,
     }),
     response: okResponse,
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
       if (args.fromDate === args.toDate) return { ok: true as const };
-      const db = ctx.db<typeof schema>();
+      const moved = await inTransaction(ctx, async (tctx) => {
+      const db = tctx.db<typeof schema>();
       const src = await db
         .select()
         .from(schema.dailyValues)
@@ -1905,7 +2181,7 @@ export const Actions = {
             eq(schema.dailyValues.itemDefinitionId, args.itemDefinitionId),
           ),
         );
-      if (src.length === 0) return { ok: true as const };
+      if (src.length === 0) return false;
       const dest = await db
         .select()
         .from(schema.dailyValues)
@@ -1930,7 +2206,9 @@ export const Actions = {
           .set({ date: args.toDate })
           .where(eq(schema.dailyValues.id, s.id));
       }
-      ctx.invalidateQueries();
+      return true;
+      });
+      if (moved) ctx.invalidateQueries();
       return { ok: true as const };
     },
   }),
@@ -1938,14 +2216,15 @@ export const Actions = {
   setDayRecord: defineAction({
     description: "Upserts the day record (day type, period pattern, note) for one date.",
     request: z.object({
-      date: z.string(),
-      dayType: z.string(),
+      date: dateStr,
+      dayType: shortStr.trim().min(1),
       periodPatternId: z.number().nullable().default(null),
-      note: z.string().default(""),
+      note: longStr.default(""),
     }),
     response: okResponse,
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
-      const db = ctx.db<typeof schema>();
+      const result = await inTransaction(ctx, async (tctx) => {
+      const db = tctx.db<typeof schema>();
       const existing = await db
         .select()
         .from(schema.dayRecords)
@@ -1968,8 +2247,10 @@ export const Actions = {
           note: args.note,
         });
       }
-      ctx.invalidateQueries();
       return { ok: true as const };
+      });
+      ctx.invalidateQueries();
+      return result;
     },
   }),
 
@@ -1977,18 +2258,19 @@ export const Actions = {
     description:
       "Sets (or clears, when all values are null) one daily value cell: date × item × target × slot.",
     request: z.object({
-      date: z.string(),
+      date: dateStr,
       itemDefinitionId: z.number(),
       targetId: z.number().nullable().default(null),
-      slot: z.string().default("all_day"),
-      valueText: z.string().nullable().default(null),
+      slot: eventSlotEnum.default("all_day"),
+      valueText: longStr.nullable().default(null),
       valueNumber: z.number().nullable().default(null),
       valueOptionId: z.number().nullable().default(null),
       valuePersonId: z.number().nullable().default(null),
     }),
     response: okResponse,
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
-      const db = ctx.db<typeof schema>();
+      const result = await inTransaction(ctx, async (tctx) => {
+      const db = tctx.db<typeof schema>();
       const existing = await db
         .select()
         .from(schema.dailyValues)
@@ -2033,8 +2315,10 @@ export const Actions = {
           valuePersonId: args.valuePersonId,
         });
       }
-      ctx.invalidateQueries();
       return { ok: true as const };
+      });
+      ctx.invalidateQueries();
+      return result;
     },
   }),
 
@@ -2043,14 +2327,15 @@ export const Actions = {
       "Manually sets one duty assignment cell (marks it as a manual override so rotation regeneration never overwrites it). Null person clears the assignment.",
     request: z.object({
       dutyDefinitionId: z.number(),
-      date: z.string(),
-      slot: z.string().default("all_day"),
+      date: dateStr,
+      slot: dutySlotEnum.default("all_day"),
       personId: z.number().nullable().default(null),
-      freeTextName: z.string().nullable().default(null),
+      freeTextName: shortStr.nullable().default(null),
     }),
     response: okResponse,
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
-      const db = ctx.db<typeof schema>();
+      const result = await inTransaction(ctx, async (tctx) => {
+      const db = tctx.db<typeof schema>();
       const existing = await db
         .select()
         .from(schema.dutyAssignments)
@@ -2087,8 +2372,10 @@ export const Actions = {
           origin: "manual",
         });
       }
-      ctx.invalidateQueries();
       return { ok: true as const };
+      });
+      ctx.invalidateQueries();
+      return result;
     },
   }),
 
@@ -2097,9 +2384,12 @@ export const Actions = {
       "Previews a simple rotation assignment draft for a duty definition over a date range, cycling the rotation member order and optionally skipping weekends and holidays.",
     request: z.object({
       dutyDefinitionId: z.number(),
-      from: z.string(),
-      to: z.string(),
-      startIndex: z.number().int().min(0).default(0),
+      from: dateStr,
+      to: dateStr,
+      // null (default): continue the cycle from the member after whoever
+      // held the latest assignment before `from`, so month-by-month
+      // generation does not restart at the first member every time.
+      startIndex: z.number().int().min(0).nullable().default(null),
       skipWeekend: z.boolean().default(true),
       skipHoliday: z.boolean().default(true),
     }),
@@ -2137,7 +2427,23 @@ export const Actions = {
         personId: number | null;
         personName: string;
       }[] = [];
-      let idx = args.startIndex % members.length;
+      checkRange(args.from, args.to, "生成期間");
+      let start = args.startIndex;
+      if (start == null) {
+        const [last] = await db
+          .select()
+          .from(schema.dutyAssignments)
+          .where(
+            and(
+              eq(schema.dutyAssignments.dutyDefinitionId, def.id),
+              lt(schema.dutyAssignments.date, args.from),
+            ),
+          )
+          .orderBy(desc(schema.dutyAssignments.date), desc(schema.dutyAssignments.slot))
+          .limit(1);
+        start = nextRotationIndex(members, last ?? null);
+      }
+      let idx = start % members.length;
       const next = () => {
         const m = members[idx % members.length]!;
         idx++;
@@ -2153,11 +2459,7 @@ export const Actions = {
         const dow = parseDate(d).getDay();
         if (args.skipWeekend && (dow === 0 || dow === 6)) return true;
         if (args.skipHoliday && holidaySet.has(d)) return true;
-        if (
-          def.applicablePeriod !== "all_year" &&
-          ((def.startsOn && d < def.startsOn) || (def.endsOn && d > def.endsOn))
-        )
-          return true;
+        if (!dutyAppliesOn(def, d)) return true;
         return false;
       };
       if (def.granularity === "week") {
@@ -2189,18 +2491,21 @@ export const Actions = {
       "Applies rotation draft entries, skipping any slot that already has an assignment (manual overrides and swaps are never overwritten).",
     request: z.object({
       dutyDefinitionId: z.number(),
-      entries: z.array(
-        z.object({
-          date: z.string(),
-          slot: z.string(),
-          personId: z.number().nullable(),
-          personName: z.string().default(""),
-        }),
-      ),
+      entries: z
+        .array(
+          z.object({
+            date: dateStr,
+            slot: dutySlotEnum,
+            personId: z.number().nullable(),
+            personName: shortStr.default(""),
+          }),
+        )
+        .max(2000),
     }),
     response: z.object({ inserted: z.number(), skipped: z.number() }),
     async handler(ctx, args) {
-      const db = ctx.db<typeof schema>();
+      const result = await inTransaction(ctx, async (tctx) => {
+      const db = tctx.db<typeof schema>();
       let inserted = 0;
       let skipped = 0;
       for (const e of args.entries) {
@@ -2230,82 +2535,93 @@ export const Actions = {
         });
         inserted++;
       }
-      ctx.invalidateQueries();
       return { inserted, skipped };
+      });
+      ctx.invalidateQueries();
+      return result;
     },
   }),
 
   applyDutyChange: defineAction({
     description:
-      "Applies a duty change as a first-class operation: swap exchanges two assignments' people; substitute replaces one assignment's person for that occasion only. The change is recorded in duty change history.",
+      "Applies a duty change as a first-class operation: swap exchanges two assignments' people; substitute replaces one assignment's person for that occasion only. Both assignments and the history row are written in one transaction (DESIGN §4.7.1), and a swap is only allowed between assignments of the same duty.",
     request: z.object({
       kind: z.enum(["swap", "substitute"]),
       assignmentAId: z.number(),
       assignmentBId: z.number().nullable().default(null),
       toPersonId: z.number().nullable().default(null),
-      toFreeTextName: z.string().nullable().default(null),
-      reason: z.string().default(""),
+      toFreeTextName: shortStr.nullable().default(null),
+      reason: longStr.default(""),
     }),
     response: okResponse,
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
-      const db = ctx.db<typeof schema>();
-      const [a] = await db
-        .select()
-        .from(schema.dutyAssignments)
-        .where(eq(schema.dutyAssignments.id, args.assignmentAId))
-        .limit(1);
-      if (!a) throw new Error("対象の当番割当が見つかりません");
-      const peopleRows = await db.select().from(schema.people);
-      const personName = new Map(peopleRows.map((p) => [p.id, p.name]));
-      const label = (personId: number | null, free: string | null) =>
-        (personId != null ? personName.get(personId) : undefined) ?? free ?? "未割当";
-      const fromLabel = `${a.date} ${label(a.personId, a.freeTextName)}`;
-      if (args.kind === "swap") {
-        if (args.assignmentBId == null) throw new Error("交換相手の割当が必要です");
-        const [b] = await db
+      await inTransaction(ctx, async (tctx) => {
+        const db = tctx.db<typeof schema>();
+        const [a] = await db
           .select()
           .from(schema.dutyAssignments)
-          .where(eq(schema.dutyAssignments.id, args.assignmentBId))
+          .where(eq(schema.dutyAssignments.id, args.assignmentAId))
           .limit(1);
-        if (!b) throw new Error("交換相手の割当が見つかりません");
-        await db
-          .update(schema.dutyAssignments)
-          .set({ personId: b.personId, freeTextName: b.freeTextName, origin: "swap" })
-          .where(eq(schema.dutyAssignments.id, a.id));
-        await db
-          .update(schema.dutyAssignments)
-          .set({ personId: a.personId, freeTextName: a.freeTextName, origin: "swap" })
-          .where(eq(schema.dutyAssignments.id, b.id));
-        await db.insert(schema.dutyChanges).values({
-          dutyDefinitionId: a.dutyDefinitionId,
-          kind: "swap",
-          assignmentAId: a.id,
-          assignmentBId: b.id,
-          fromLabel,
-          toLabel: `${b.date} ${label(b.personId, b.freeTextName)} と交換`,
-          reason: args.reason,
-          status: "applied",
-        });
-      } else {
-        await db
-          .update(schema.dutyAssignments)
-          .set({
-            personId: args.toPersonId,
-            freeTextName: args.toPersonId == null ? args.toFreeTextName : null,
-            origin: "swap",
-          })
-          .where(eq(schema.dutyAssignments.id, a.id));
-        await db.insert(schema.dutyChanges).values({
-          dutyDefinitionId: a.dutyDefinitionId,
-          kind: "substitute",
-          assignmentAId: a.id,
-          assignmentBId: null,
-          fromLabel,
-          toLabel: `${label(args.toPersonId, args.toFreeTextName)} が代行`,
-          reason: args.reason,
-          status: "applied",
-        });
-      }
+        if (!a) throw new Error("対象の当番割当が見つかりません");
+        const peopleRows = await db.select().from(schema.people);
+        const personName = new Map(peopleRows.map((p) => [p.id, p.name]));
+        const label = (personId: number | null, free: string | null) =>
+          (personId != null ? personName.get(personId) : undefined) ?? free ?? "未割当";
+        const fromLabel = `${a.date} ${label(a.personId, a.freeTextName)}`;
+        if (args.kind === "swap") {
+          if (args.assignmentBId == null) throw new Error("交換相手の割当が必要です");
+          if (args.assignmentBId === a.id) throw new Error("同じ割当どうしは交換できません");
+          const [b] = await db
+            .select()
+            .from(schema.dutyAssignments)
+            .where(eq(schema.dutyAssignments.id, args.assignmentBId))
+            .limit(1);
+          if (!b) throw new Error("交換相手の割当が見つかりません");
+          if (b.dutyDefinitionId !== a.dutyDefinitionId)
+            throw new Error("交換できるのは同じ当番の割当どうしだけです");
+          await db
+            .update(schema.dutyAssignments)
+            .set({ personId: b.personId, freeTextName: b.freeTextName, origin: "swap" })
+            .where(eq(schema.dutyAssignments.id, a.id));
+          await db
+            .update(schema.dutyAssignments)
+            .set({ personId: a.personId, freeTextName: a.freeTextName, origin: "swap" })
+            .where(eq(schema.dutyAssignments.id, b.id));
+          await db.insert(schema.dutyChanges).values({
+            dutyDefinitionId: a.dutyDefinitionId,
+            kind: "swap",
+            assignmentAId: a.id,
+            assignmentBId: b.id,
+            fromLabel,
+            toLabel: `${b.date} ${label(b.personId, b.freeTextName)} と交換`,
+            reason: args.reason,
+            status: "applied",
+          });
+        } else {
+          const toFree = args.toFreeTextName?.trim() || null;
+          if (args.toPersonId == null && !toFree) throw new Error("代行者を指定してください");
+          if (args.toPersonId != null && !personName.has(args.toPersonId))
+            throw new Error("代行者が人の一覧に見つかりません");
+          await db
+            .update(schema.dutyAssignments)
+            .set({
+              personId: args.toPersonId,
+              freeTextName: args.toPersonId == null ? toFree : null,
+              origin: "substitute",
+            })
+            .where(eq(schema.dutyAssignments.id, a.id));
+          await db.insert(schema.dutyChanges).values({
+            dutyDefinitionId: a.dutyDefinitionId,
+            kind: "substitute",
+            assignmentAId: a.id,
+            assignmentBId: null,
+            fromLabel,
+            toLabel: `${label(args.toPersonId, toFree)} が代行`,
+            reason: args.reason,
+            status: "applied",
+          });
+        }
+      });
       ctx.invalidateQueries();
       return { ok: true as const };
     },
@@ -2313,19 +2629,50 @@ export const Actions = {
 
   waiveConflict: defineAction({
     description:
-      "Records that an absence/duty conflict was reviewed and intentionally left as-is, with a reason. The conflict stops being reported for that assignment/event pair.",
+      "Records that an absence/duty conflict was reviewed and intentionally left as-is, with a reason. The conflict stops being reported for that assignment/event pair. Recording the same pair again updates its reason instead of adding a duplicate.",
     request: z.object({
       assignmentId: z.number(),
       eventId: z.number(),
-      reason: z.string().default(""),
+      reason: longStr.default(""),
     }),
     response: okResponse,
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
-      const db = ctx.db<typeof schema>();
-      await db.insert(schema.dutyConflictWaivers).values({
-        assignmentId: args.assignmentId,
-        eventId: args.eventId,
-        reason: args.reason,
+      await inTransaction(ctx, async (tctx) => {
+        const db = tctx.db<typeof schema>();
+        const [a] = await db
+          .select({ id: schema.dutyAssignments.id })
+          .from(schema.dutyAssignments)
+          .where(eq(schema.dutyAssignments.id, args.assignmentId))
+          .limit(1);
+        if (!a) throw new Error("対象の当番割当が見つかりません");
+        const [e] = await db
+          .select({ id: schema.events.id })
+          .from(schema.events)
+          .where(eq(schema.events.id, args.eventId))
+          .limit(1);
+        if (!e) throw new Error("対象の予定が見つかりません");
+        const [existing] = await db
+          .select()
+          .from(schema.dutyConflictWaivers)
+          .where(
+            and(
+              eq(schema.dutyConflictWaivers.assignmentId, args.assignmentId),
+              eq(schema.dutyConflictWaivers.eventId, args.eventId),
+            ),
+          )
+          .limit(1);
+        if (existing) {
+          await db
+            .update(schema.dutyConflictWaivers)
+            .set({ reason: args.reason })
+            .where(eq(schema.dutyConflictWaivers.id, existing.id));
+        } else {
+          await db.insert(schema.dutyConflictWaivers).values({
+            assignmentId: args.assignmentId,
+            eventId: args.eventId,
+            reason: args.reason,
+          });
+        }
       });
       ctx.invalidateQueries();
       return { ok: true as const };
@@ -2336,11 +2683,11 @@ export const Actions = {
     description: "Creates or updates a view definition (layout, audience, column composition, print settings).",
     request: z.object({
       id: z.number().nullable().default(null),
-      name: z.string().min(1),
-      layout: z.string().default("month_rows"),
-      audience: z.string().default("staff"),
-      columnsJson: z.string().default("[]"),
-      printJson: z.string().default("{}"),
+      name: nameStr,
+      layout: layoutEnum.default("month_rows"),
+      audience: audienceEnum.default("staff"),
+      columnsJson: jsonText(Array.isArray, "列構成").default("[]"),
+      printJson: jsonText((v) => typeof v === "object" && v !== null && !Array.isArray(v), "印刷設定").default("{}"),
       sort: z.number().default(0),
     }),
     response: idResponse,
@@ -2419,10 +2766,12 @@ export const Actions = {
       "Records a publication version for a monthly view (the version label printed on the PDF/print output).",
     request: z.object({
       viewDefinitionId: z.number().nullable().default(null),
-      viewName: z.string().default(""),
-      targetMonth: z.string(),
-      versionLabel: z.string().min(1),
-      note: z.string().default(""),
+      viewName: shortStr.default(""),
+      targetMonth: z
+        .string()
+        .regex(/^\d{4}(-(0[1-9]|1[0-2])|年度)$/, "対象期間は YYYY-MM または YYYY年度 の形式で指定してください"),
+      versionLabel: nameStr,
+      note: longStr.default(""),
     }),
     response: idResponse,
     async handler(ctx, args) {
@@ -2447,8 +2796,8 @@ export const Actions = {
       "Edits a recorded publication version (its version label and note). The target period and view name stay as recorded.",
     request: z.object({
       id: z.number(),
-      versionLabel: z.string().min(1),
-      note: z.string().default(""),
+      versionLabel: nameStr,
+      note: longStr.default(""),
     }),
     response: okResponse,
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
@@ -2485,16 +2834,18 @@ export const Actions = {
       rows: z
         .array(
           z.object({
-            title: z.string(),
-            category: z.string().default("行事"),
-            startsOn: z.string(),
-            endsOn: z.string().nullable().default(null),
-            startsAt: z.string().nullable().default(null),
-            endsAt: z.string().nullable().default(null),
-            locationName: z.string().nullable().default(null),
-            assigneeNames: z.array(z.string()).default([]),
-            leaveType: z.string().nullable().default(null),
-            description: z.string().default(""),
+            // Row values are checked per row in the handler (bad rows are
+            // skipped with a reason), so only lengths are enforced here.
+            title: shortStr,
+            category: shortStr.default("行事"),
+            startsOn: z.string().max(20),
+            endsOn: z.string().max(20).nullable().default(null),
+            startsAt: z.string().max(10).nullable().default(null),
+            endsAt: z.string().max(10).nullable().default(null),
+            locationName: shortStr.nullable().default(null),
+            assigneeNames: z.array(shortStr).max(50).default([]),
+            leaveType: shortStr.nullable().default(null),
+            description: longStr.default(""),
           }),
         )
         .max(1000),
@@ -2505,12 +2856,14 @@ export const Actions = {
       errors: z.array(z.object({ row: z.number(), reason: z.string() })),
     }),
     async handler(ctx, args) {
-      const db = ctx.db<typeof schema>();
+      const result = await inTransaction(ctx, async (tctx) => {
+      const db = tctx.db<typeof schema>();
       const peopleRows = await db.select().from(schema.people);
       const personByName = new Map(peopleRows.map((p) => [p.name, p.id]));
       const locRows = await db.select().from(schema.locations);
       const locByName = new Map(locRows.map((l) => [l.name, l.id]));
-      const dateOk = (s: string) => /^\d{4}-\d{2}-\d{2}$/.test(s);
+      const dateOk = isValidDateString;
+      const timeOrNull = (t: string | null) => (t && isValidTimeString(t) ? t : null);
       let created = 0;
       const errors: { row: number; reason: string }[] = [];
       for (let i = 0; i < args.rows.length; i++) {
@@ -2535,9 +2888,9 @@ export const Actions = {
             datePrecision: endsOn > r.startsOn ? "range" : "day",
             startsOn: r.startsOn,
             endsOn,
-            startsAt: r.startsAt,
-            endsAt: r.endsAt,
-            isAllDay: r.startsAt ? 0 : 1,
+            startsAt: timeOrNull(r.startsAt),
+            endsAt: timeOrNull(r.endsAt),
+            isAllDay: timeOrNull(r.startsAt) ? 0 : 1,
             slot: "all_day",
             locationId,
             locationText: locName != null && locationId == null ? locName : null,
@@ -2561,8 +2914,10 @@ export const Actions = {
         }
         created++;
       }
-      ctx.invalidateQueries();
       return { created, skipped: errors.length, errors };
+      });
+      ctx.invalidateQueries();
+      return result;
     },
   }),
 
@@ -2691,7 +3046,8 @@ export const Actions = {
       createdViews: number;
       skipped: number;
     }> {
-      const db = ctx.db<typeof schema>();
+      const result = await inTransaction(ctx, async (tctx) => {
+      const db = tctx.db<typeof schema>();
       let tpl: Record<string, unknown>;
       try {
         tpl = JSON.parse(args.templateJson) as Record<string, unknown>;
@@ -2715,7 +3071,7 @@ export const Actions = {
       // settings part: leave types only (school name / year stay local)
       const tSettings = (tpl.settings ?? {}) as Record<string, unknown>;
       if (Array.isArray(tSettings.leaveTypes) && tSettings.leaveTypes.length > 0) {
-        await loadSettings(ctx);
+        await loadSettings(tctx);
         await db
           .update(schema.settings)
           .set({ leaveTypesJson: JSON.stringify(tSettings.leaveTypes) })
@@ -2891,7 +3247,6 @@ export const Actions = {
         createdViews++;
       }
 
-      ctx.invalidateQueries();
       return {
         ok: true as const,
         createdGroups,
@@ -2901,6 +3256,9 @@ export const Actions = {
         createdViews,
         skipped,
       };
+      });
+      ctx.invalidateQueries();
+      return result;
     },
   }),
 

@@ -11,3 +11,5 @@ audits/
 dist/
 .env
 .env.*
+*.tsbuildinfo*
+.tsbuildinfo*

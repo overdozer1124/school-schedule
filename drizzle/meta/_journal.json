@@ -29,6 +29,20 @@
       "when": 1793944045171,
       "tag": "0004_add_leave_types_to_settings",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1793948521593,
+      "tag": "0005_phase3_link_entitlements_master_links",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1793948864542,
+      "tag": "0006_add_column_widths_to_views",
+      "breakpoints": true
     }
   ]
 }

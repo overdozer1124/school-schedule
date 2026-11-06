@@ -185,6 +185,73 @@ export function targetRangeLabel(names: string[]): string {
   }
   return `${first}～${last}`;
 }
+// ---- Phase 3: entitlements & link mode (DESIGN §10) ----
+export type Entitlement = Bootstrap["entitlements"][number];
+export type MasterLink = Bootstrap["masterLinks"][number];
+export const PRODUCT_LABELS: Record<string, string> = {
+  event_schedule: "行事予定",
+  timetable: "時間割（school-timetable）",
+};
+export const PLAN_LABELS: Record<string, string> = {
+  free: "フリー",
+  standard: "スタンダード",
+  pro: "プロ",
+};
+export const ENT_STATUS_LABELS: Record<string, string> = {
+  active: "有効",
+  trial: "体験中",
+  suspended: "停止",
+  none: "未契約",
+};
+/**
+ * The entitlement row that governs this school for a product: an exact
+ * school-name match wins, then a row with a blank school name (meaning
+ * "this school"). No governing row means the product is treated as
+ * usable — entitlements only restrict once someone records them.
+ */
+export function governingEntitlement(
+  bootstrap: Bootstrap,
+  product: string,
+): Entitlement | undefined {
+  const rows = bootstrap.entitlements.filter((e) => e.product === product);
+  const name = bootstrap.settings.schoolName;
+  return (
+    rows.find((e) => name !== "" && e.schoolName === name) ??
+    rows.find((e) => e.schoolName === "") ??
+    (rows.length === 1 ? rows[0] : undefined)
+  );
+}
+export function entitlementUsable(e: Entitlement | undefined): boolean {
+  if (!e) return true;
+  return e.status === "active" || e.status === "trial";
+}
+
+/** Stable identity key for a view column, used to store its drag-adjusted width. */
+export function columnWidthKey(c: ColumnDef): string {
+  if (c.kind === "category") return `cat:${c.category ?? ""}`;
+  if (c.kind === "daily_item") return `item:${c.itemId ?? ""}`;
+  return `duty:${c.dutyId ?? ""}`;
+}
+export const COL_WIDTH_MIN = 48;
+export const COL_WIDTH_MAX = 800;
+export function clampColWidth(w: number): number {
+  return Math.min(COL_WIDTH_MAX, Math.max(COL_WIDTH_MIN, Math.round(w)));
+}
+/** Parses a view's saved column widths (px, keyed by column identity). */
+export function parseWidths(view: ViewDef | null): Record<string, number> {
+  if (!view) return {};
+  try {
+    const obj = JSON.parse(view.widthsJson) as Record<string, unknown>;
+    if (obj == null || typeof obj !== "object") return {};
+    const out: Record<string, number> = {};
+    for (const [k, v] of Object.entries(obj)) {
+      if (typeof v === "number" && Number.isFinite(v)) out[k] = clampColWidth(v);
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
 export function parseColumns(view: ViewDef | null): ColumnDef[] {
   if (!view) return [{ kind: "category", category: "行事", label: "行事等予定" }];
   try {

@@ -17,11 +17,16 @@ LAYOUTS,
 VIS_RANK,
 WEEKDAYS,
 addDays,
+clampColWidth,
+columnWidthKey,
+parseWidths,
 addMonths,
 dayLabel,
 eachDate,
+entitlementUsable,
 eventHeadline,
 eventsOnDate,
+governingEntitlement,
 mondayOf,
 monthEnd,
 monthLabel,
@@ -124,6 +129,15 @@ type TableCtx = {
   ) => void;
   /** True right after a pointer drag ended, so the trailing click is ignored. */
   shouldSuppressClick: () => boolean;
+  // ---- column width drag-resize (per view definition, persisted) ----
+  /** Effective column widths in px, keyed by column identity. */
+  colWidths: Record<string, number>;
+  /**
+   * Reports a column-width change. During a drag (commit=false) it only
+   * previews; on release (commit=true) it persists. width=null on commit
+   * removes the saved width (back to the default).
+   */
+  onResizeColumn?: (key: string, width: number | null, commit: boolean) => void;
 };
 
 /** Props that turn any cell element into a drop target for drag & drop. */
@@ -843,6 +857,69 @@ function focusCellField(e: ReactMouseEvent<HTMLElement>) {
   field?.focus();
 }
 
+/**
+ * Drag handle on the right edge of a table header cell. Dragging adjusts
+ * the column width live (preview only); releasing saves it to the view
+ * definition. Double-click removes the saved width (back to default).
+ * Arrow keys adjust in 8px steps and save immediately.
+ */
+function ColResizeHandle({
+  label,
+  width,
+  defaultWidth,
+  onResize,
+}: {
+  label: string;
+  width: number | null;
+  defaultWidth: number;
+  onResize: (width: number | null, commit: boolean) => void;
+}) {
+  const startDrag = (e: ReactPointerEvent<HTMLSpanElement>) => {
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const th = e.currentTarget.closest("th");
+    const startWidth = width ?? th?.getBoundingClientRect().width ?? defaultWidth;
+    const startX = e.clientX;
+    let last = clampColWidth(startWidth);
+    const move = (ev: PointerEvent) => {
+      last = clampColWidth(startWidth + (ev.clientX - startX));
+      onResize(last, false);
+    };
+    const finish = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", finish);
+      window.removeEventListener("pointercancel", finish);
+      onResize(last, true);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", finish);
+    window.addEventListener("pointercancel", finish);
+  };
+  return (
+    <span
+      role="separator"
+      aria-orientation="vertical"
+      aria-label={`${label}の列幅を調整`}
+      title="ドラッグで列幅を調整（ダブルクリックで初期幅に戻す）"
+      tabIndex={0}
+      className="absolute inset-y-0 right-0 z-20 w-2.5 cursor-col-resize touch-none outline-none hover:bg-[var(--accent)]/40 focus-visible:bg-[var(--accent)]/40"
+      onPointerDown={startDrag}
+      onDoubleClick={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        onResize(null, true);
+      }}
+      onKeyDown={(e) => {
+        if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+        e.preventDefault();
+        const base = width ?? defaultWidth;
+        onResize(clampColWidth(base + (e.key === "ArrowRight" ? 8 : -8)), true);
+      }}
+    />
+  );
+}
+
 function RowsTable({
   ctx,
   dates,
@@ -855,22 +932,63 @@ function RowsTable({
     const rec = ctx.range.dayRecords.find((d) => d.date === date);
     return dow === 0 || dow === 6 || ctx.holidayMap.has(date) || rec?.dayType === "休業日";
   };
+  // Column widths are drag-adjustable on screen (not in the print sheet).
+  // Fixed layout + colgroup makes the saved px widths exact; columns
+  // without a saved width share the remaining space equally.
+  const resizable = !ctx.readOnly && ctx.onResizeColumn != null;
+  const dateW = ctx.colWidths["date"];
+  const minTableWidth = resizable
+    ? (dateW ?? 64) +
+      ctx.columns.reduce((sum, c) => sum + (ctx.colWidths[columnWidthKey(c)] ?? 160), 0)
+    : undefined;
   return (
     <div className="overflow-x-auto">
-      <table className="w-full border-collapse text-sm">
+      <table
+        className={`${resizable ? "w-full table-fixed" : "min-w-full"} border-collapse text-sm`}
+        style={minTableWidth != null ? { minWidth: minTableWidth } : undefined}
+      >
+        {resizable && (
+          <colgroup>
+            <col style={{ width: dateW ?? 64 }} />
+            {ctx.columns.map((c, i) => (
+              <col key={i} style={{ width: ctx.colWidths[columnWidthKey(c)] }} />
+            ))}
+          </colgroup>
+        )}
         <thead>
           <tr className="bg-[var(--bg)]">
-            <th className="sticky left-0 z-10 border border-[var(--border)] bg-[var(--bg)] px-2 py-1 text-left font-medium">
+            <th
+              className={`sticky left-0 z-10 border border-[var(--border)] bg-[var(--bg)] px-2 py-1 text-left font-medium${resizable ? "" : " w-16"}`}
+            >
               日
+              {resizable && (
+                <ColResizeHandle
+                  label="日"
+                  width={dateW ?? null}
+                  defaultWidth={64}
+                  onResize={(w, commit) => ctx.onResizeColumn?.("date", w, commit)}
+                />
+              )}
             </th>
-            {ctx.columns.map((c, i) => (
-              <th
-                key={i}
-                className="border border-[var(--border)] px-2 py-1 text-left font-medium"
-              >
-                {c.label}
-              </th>
-            ))}
+            {ctx.columns.map((c, i) => {
+              const wKey = columnWidthKey(c);
+              return (
+                <th
+                  key={i}
+                  className={`border border-[var(--border)] px-2 py-1 text-left font-medium${resizable ? " relative" : " min-w-40"}`}
+                >
+                  {c.label}
+                  {resizable && (
+                    <ColResizeHandle
+                      label={c.label}
+                      width={ctx.colWidths[wKey] ?? null}
+                      defaultWidth={160}
+                      onResize={(w, commit) => ctx.onResizeColumn?.(wKey, w, commit)}
+                    />
+                  )}
+                </th>
+              );
+            })}
           </tr>
         </thead>
         <tbody>
@@ -975,7 +1093,7 @@ function YearView({
         const first = `${y}-${String(m).padStart(2, "0")}-01`;
         const dates = eachDate(first, monthEnd(first));
         return (
-          <div key={first} className="min-w-72 shrink-0">
+          <div key={first} className="min-w-96 shrink-0">
             <h3 className="mb-1 font-serif text-base font-bold">{m}月</h3>
             <RowsTable ctx={ctx} dates={dates} />
           </div>
@@ -1033,23 +1151,58 @@ function TransposedView({
     ...group.targets.map((t) => ({ targetId: t.id as number | null, name: t.name })),
     ...(hasLooseValues ? [{ targetId: null, name: "（対象指定なし）" }] : []),
   ];
+  // Same drag-resize as the row tables: the target column has its own
+  // width; all day columns share one uniform width.
+  const resizable = !ctx.readOnly && ctx.onResizeColumn != null;
+  const targetW = ctx.colWidths["target"];
+  const dayW = ctx.colWidths["day"];
+  const minTableWidth = resizable
+    ? (targetW ?? 140) + dates.length * (dayW ?? 112)
+    : undefined;
   return (
     <div className="overflow-x-auto">
-      <table className="border-collapse text-sm">
+      <table
+        className={`w-full border-collapse text-sm${resizable ? " table-fixed" : ""}`}
+        style={minTableWidth != null ? { minWidth: minTableWidth } : undefined}
+      >
+        {resizable && (
+          <colgroup>
+            <col style={{ width: targetW ?? 140 }} />
+            {dates.map((date) => (
+              <col key={date} style={{ width: dayW ?? 112 }} />
+            ))}
+          </colgroup>
+        )}
         <thead>
           <tr className="bg-[var(--bg)]">
             <th className="sticky left-0 z-10 border border-[var(--border)] bg-[var(--bg)] px-2 py-1 text-left font-medium">
               {group.name}
+              {resizable && (
+                <ColResizeHandle
+                  label={group.name}
+                  width={targetW ?? null}
+                  defaultWidth={140}
+                  onResize={(w, commit) => ctx.onResizeColumn?.("target", w, commit)}
+                />
+              )}
             </th>
             {dates.map((date) => {
               const { cls } = dateCellStyle(ctx, date);
               return (
                 <th
                   key={date}
-                  className={`border border-[var(--border)] px-1 py-1 text-center font-medium ${cls}`}
+                  className={`border border-[var(--border)] px-1 py-1 text-center font-medium ${cls}${resizable ? " relative" : ""}`}
                 >
                   {Number(date.slice(8, 10))}
                   <span className="ml-0.5 text-[10px]">({WEEKDAYS[weekdayOf(date)]})</span>
+                  {resizable && (
+                    <ColResizeHandle
+                      label="日"
+                      width={dayW ?? null}
+                      defaultWidth={112}
+                      onResize={(w, commit) => ctx.onResizeColumn?.("day", w, commit)}
+                    />
+                  )}
                 </th>
               );
             })}
@@ -1072,7 +1225,7 @@ function TransposedView({
                 return (
                   <td
                     key={date}
-                    className={`min-w-20 border border-[var(--border)] px-1 py-1 align-top${dropHighlightCls(ctx, key)}`}
+                    className={`${resizable ? "" : "min-w-28 "}border border-[var(--border)] px-1 py-1 align-top${dropHighlightCls(ctx, key)}`}
                     onClick={ctx.readOnly ? undefined : focusCellField}
                     {...dropTargetProps(ctx, { date })}
                   >
@@ -1732,6 +1885,9 @@ function PrintPreview({
     onPointerStartEvent: noop,
     onPointerStartDaily: noop,
     shouldSuppressClick: () => false,
+    // Print output keeps its current fit-to-page widths; drag-adjusted
+    // screen widths are not applied to the print sheet.
+    colWidths: {},
   };
   const rowDates =
     layout === "month_rows"
@@ -1740,7 +1896,7 @@ function PrintPreview({
   return (
     <div className="fixed inset-0 z-50 overflow-y-auto bg-black/50 p-2 sm:p-4" role="dialog" aria-modal="true" aria-label="印刷プレビュー">
       <style>{`@page { size: ${paper} ${orientation}; margin: 10mm; }`}</style>
-      <div className="no-print mx-auto mb-2 flex max-w-5xl flex-wrap items-center gap-2 rounded bg-[var(--surface)] p-2">
+      <div className="no-print mb-2 flex w-full flex-wrap items-center gap-2 rounded bg-[var(--surface)] p-2">
         <span className="text-sm font-medium">印刷・PDF（{paper}・{orientation === "landscape" ? "横" : "縦"}）</span>
         <input
           aria-label="版ラベル"
@@ -1777,7 +1933,7 @@ function PrintPreview({
           </p>
         )}
       </div>
-      <div id="print-sheet" className="mx-auto max-w-5xl bg-white p-4 text-black shadow">
+      <div id="print-sheet" className="w-full bg-white p-4 text-black shadow">
         <div className="mb-2 flex flex-wrap items-end justify-between gap-2 border-b-2 border-black pb-1">
           <div>
             {bootstrap.settings.schoolName && (
@@ -1894,6 +2050,60 @@ export function App() {
       ),
     };
   }, [rangeData, audienceRank]);
+
+  // Column widths live on the view definition. During a drag only the
+  // in-flight preview width is local state; on release the merged map is
+  // saved through setViewColumnWidths. The commit is applied to the
+  // bootstrap cache optimistically (onMutate) so the derived savedWidths
+  // already hold the new width when the preview is dropped on settle —
+  // otherwise the column snapped back to the old width until the
+  // invalidated bootstrap refetch landed. On error the cache rolls back
+  // and the preview drop restores the previous width.
+  const savedWidths = useMemo(() => parseWidths(view), [view]);
+  const [widthDrag, setWidthDrag] = useState<{
+    viewId: number;
+    key: string;
+    width: number;
+  } | null>(null);
+  const colWidths = useMemo(() => {
+    if (widthDrag && view && widthDrag.viewId === view.id) {
+      return { ...savedWidths, [widthDrag.key]: widthDrag.width };
+    }
+    return savedWidths;
+  }, [savedWidths, widthDrag, view]);
+  const setWidthsMut = useMutation({
+    mutationFn: (args: { viewId: number; widths: Record<string, number> }) =>
+      api.setViewColumnWidths(args),
+    onMutate: (args) => {
+      const prev = qc.getQueryData<Bootstrap>(["bootstrap"]);
+      if (prev) {
+        qc.setQueryData<Bootstrap>(["bootstrap"], {
+          ...prev,
+          views: prev.views.map((v) =>
+            v.id === args.viewId
+              ? { ...v, widthsJson: JSON.stringify(args.widths) }
+              : v,
+          ),
+        });
+      }
+      return { prev };
+    },
+    onError: (_err, _args, context) => {
+      if (context?.prev) qc.setQueryData<Bootstrap>(["bootstrap"], context.prev);
+    },
+    onSettled: () => setWidthDrag(null),
+  });
+  const handleResizeColumn = (key: string, width: number | null, commit: boolean) => {
+    if (!view) return;
+    if (!commit) {
+      if (width != null) setWidthDrag({ viewId: view.id, key, width });
+      return;
+    }
+    const next = { ...savedWidths };
+    if (width == null) delete next[key];
+    else next[key] = width;
+    setWidthsMut.mutate({ viewId: view.id, widths: next });
+  };
 
   const summaryQ = useQuery({
     queryKey: ["summary", range.from, range.to],
@@ -2290,12 +2500,18 @@ export function App() {
     conflicts: [],
     dutyChanges: [],
   };
+  // Entitlement (Phase 3, §10.1): when this school's event_schedule
+  // entitlement is recorded as suspended / not contracted, the schedule
+  // becomes view-only. No recorded entitlement means usable.
+  const scheduleEnt = governingEntitlement(bootstrap, "event_schedule");
+  const scheduleRestricted = !entitlementUsable(scheduleEnt);
   const ctx: TableCtx = {
     bootstrap,
     range: displayRange ?? emptyRange,
     columns,
     holidayMap,
-    onOpenEvent: (e) => setEditingEvent(e),
+    readOnly: scheduleRestricted,
+    onOpenEvent: scheduleRestricted ? () => undefined : (e) => setEditingEvent(e),
     onQuickAdd: quickAdd,
     onSetDaily: (args) => setDailyMut.mutate(args),
     onSetDuty: (defId, date, slot, personId, freeText) =>
@@ -2316,6 +2532,9 @@ export function App() {
     onPointerStartEvent,
     onPointerStartDaily,
     shouldSuppressClick,
+    colWidths,
+    onResizeColumn:
+      scheduleRestricted || !view ? undefined : handleResizeColumn,
   };
 
   const periodLabel = (() => {
@@ -2354,7 +2573,7 @@ export function App() {
       {screen === "settings" ? (
         <SettingsPanel bootstrap={bootstrap} onClose={() => setScreen("table")} />
       ) : (
-        <main className="mx-auto w-full max-w-7xl px-2 pb-10 sm:px-4">
+        <main className="w-full px-1 pb-10 sm:px-2">
           {/* controls */}
           <div className="flex flex-wrap items-center gap-2 py-3">
             <select
@@ -2401,6 +2620,11 @@ export function App() {
             <h1 className="font-serif text-lg font-bold">{periodLabel}</h1>
             {bootstrap.settings.schoolName && (
               <span className="text-sm text-[var(--dim)]">{bootstrap.settings.schoolName}</span>
+            )}
+            {bootstrap.settings.linkMode === "linked" && (
+              <span className="rounded bg-[var(--bg)] px-2 py-0.5 text-xs text-[var(--dim)]" title="試作では実連携・SSOは行っていません">
+                連携モード（試作）
+              </span>
             )}
             {layout === "week_rows" && (
               <span className="flex gap-1" role="group" aria-label="週表示の日数">
@@ -2470,6 +2694,17 @@ export function App() {
             </span>
           </div>
 
+          {scheduleRestricted && (
+            <div className="mb-3 rounded-lg border border-[#b45309] bg-[var(--surface)] p-3" role="alert">
+              <p className="text-sm font-medium">
+                行事予定は現在「{scheduleEnt?.status === "none" ? "未契約" : "停止"}」のため、閲覧のみです（編集はできません）。
+              </p>
+              <p className="mt-0.5 text-xs text-[var(--dim)]">
+                データはそのまま保持されています。編集を再開するには、「設定・マスタ」の一番下にある「利用権限（entitlement）」で、この学校の「行事予定」の状態を「有効」または「体験中」に変更してください。時間割側の状態には影響しません。
+              </p>
+            </div>
+          )}
+
           {bootstrap.views.length === 0 && (
             <div className="mb-3 rounded-lg border border-[var(--accent)]/40 bg-[var(--surface)] p-3">
               <p className="font-serif text-base font-bold">はじめに：学校の形を選んでください</p>
@@ -2502,7 +2737,7 @@ export function App() {
             </div>
           )}
 
-          {rangeData && rangeData.events.length > 0 && (
+          {rangeData && rangeData.events.length > 0 && !scheduleRestricted && (
             <p className="pb-1 text-xs text-[var(--dim)]">
               予定はドラッグ＆ドロップで別の日へ移動できます（期間の予定は丸ごとずれます）。下校時刻など日次項目はセルの「⠿」をドラッグしてください。
             </p>
@@ -2624,9 +2859,9 @@ export function App() {
                     <button
                       key={e.id}
                       type="button"
-                      draggable
-                      aria-label={`${eventHeadline(e, bootstrap.people)}（${e.datePrecision === "undecided" ? "時期未定" : "月のみ確定"}）ドラッグで日を割り当て、クリックで詳細`}
-                      title="ドラッグで表の日に放すと、その日に割り当てられます"
+                      draggable={!scheduleRestricted}
+                      aria-label={`${eventHeadline(e, bootstrap.people)}（${e.datePrecision === "undecided" ? "時期未定" : "月のみ確定"}）${scheduleRestricted ? "" : "ドラッグで日を割り当て、クリックで詳細"}`}
+                      title={scheduleRestricted ? undefined : "ドラッグで表の日に放すと、その日に割り当てられます"}
                       className={`rounded bg-[var(--surface)] px-2 py-1 text-sm ${
                         draggingEventId === e.id ? "opacity-40" : ""
                       } cursor-grab touch-none active:cursor-grabbing`}
@@ -2641,6 +2876,7 @@ export function App() {
                         onPointerStartEvent(e, e.startsOn ?? "", ev)
                       }
                       onClick={() => {
+                        if (scheduleRestricted) return;
                         if (shouldSuppressClick()) return;
                         setEditingEvent(e);
                       }}
@@ -2653,9 +2889,11 @@ export function App() {
                     </button>
                   ))}
                 </div>
-                <p className="mt-1 text-xs text-[var(--dim)]">
-                  未定の予定は、ドラッグして表の日のセルへ放すとその日に割り当てられます。
-                </p>
+                {!scheduleRestricted && (
+                  <p className="mt-1 text-xs text-[var(--dim)]">
+                    未定の予定は、ドラッグして表の日のセルへ放すとその日に割り当てられます。
+                  </p>
+                )}
                 </>
               )}
             </section>

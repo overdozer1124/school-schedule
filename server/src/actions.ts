@@ -93,6 +93,10 @@ async function loadSettings(ctx: Ctx) {
       schoolYear: 2026,
       presetApplied: null as string | null,
       leaveTypes: [...DEFAULT_LEAVE_TYPES],
+      linkMode: "standalone",
+      peopleSource: "local",
+      targetsSource: "local",
+      periodsSource: "local",
     };
   }
   const r = rows[0]!;
@@ -101,6 +105,10 @@ async function loadSettings(ctx: Ctx) {
     schoolYear: r.schoolYear,
     presetApplied: r.presetApplied,
     leaveTypes: parseLeaveTypes(r.leaveTypesJson),
+    linkMode: r.linkMode ?? "standalone",
+    peopleSource: r.peopleSource ?? "local",
+    targetsSource: r.targetsSource ?? "local",
+    periodsSource: r.periodsSource ?? "local",
   };
 }
 
@@ -161,6 +169,7 @@ const viewShape = z.object({
   layout: z.string(),
   audience: z.string(),
   columnsJson: z.string(),
+  widthsJson: z.string(),
   printJson: z.string(),
   sort: z.number(),
 });
@@ -793,7 +802,35 @@ export const Actions = {
         schoolYear: z.number(),
         presetApplied: z.string().nullable(),
         leaveTypes: z.array(z.string()),
+        linkMode: z.string(),
+        peopleSource: z.string(),
+        targetsSource: z.string(),
+        periodsSource: z.string(),
       }),
+      masterLinks: z.array(
+        z.object({
+          id: z.number(),
+          kind: z.string(),
+          localKey: z.string(),
+          localName: z.string(),
+          linkedName: z.string(),
+          linkedId: z.string(),
+          status: z.string(),
+        }),
+      ),
+      entitlements: z.array(
+        z.object({
+          id: z.number(),
+          schoolName: z.string(),
+          product: z.string(),
+          plan: z.string(),
+          status: z.string(),
+          startsOn: z.string().nullable(),
+          endsOn: z.string().nullable(),
+          note: z.string(),
+          sort: z.number(),
+        }),
+      ),
       people: z.array(personShape),
       locations: z.array(locationShape),
       holidays: z.array(
@@ -859,8 +896,30 @@ export const Actions = {
       const memberRows = await db.select().from(schema.rotationMembers).orderBy(asc(schema.rotationMembers.sort));
       const viewRows = await db.select().from(schema.viewDefinitions).orderBy(asc(schema.viewDefinitions.sort));
       const pubRows = await db.select().from(schema.publications).orderBy(desc(schema.publications.id));
+      const linkRows = await db.select().from(schema.masterLinks).orderBy(asc(schema.masterLinks.id));
+      const entRows = await db.select().from(schema.productEntitlements).orderBy(asc(schema.productEntitlements.sort), asc(schema.productEntitlements.id));
       return {
         settings: settingsRow,
+        masterLinks: linkRows.map((l) => ({
+          id: l.id,
+          kind: l.kind,
+          localKey: l.localKey,
+          localName: l.localName,
+          linkedName: l.linkedName,
+          linkedId: l.linkedId,
+          status: l.status,
+        })),
+        entitlements: entRows.map((e) => ({
+          id: e.id,
+          schoolName: e.schoolName,
+          product: e.product,
+          plan: e.plan,
+          status: e.status,
+          startsOn: e.startsOn,
+          endsOn: e.endsOn,
+          note: e.note,
+          sort: e.sort,
+        })),
         people: peopleRows.map((p) => ({ id: p.id, name: p.name, role: p.role, sort: p.sort })),
         locations: locationRows.map((l) => ({ id: l.id, name: l.name, kind: l.kind, sort: l.sort })),
         holidays: holidayRows.map((h) => ({ id: h.id, date: h.date, name: h.name, kind: h.kind })),
@@ -934,6 +993,7 @@ export const Actions = {
           layout: v.layout,
           audience: v.audience,
           columnsJson: v.columnsJson,
+          widthsJson: v.widthsJson,
           printJson: v.printJson,
           sort: v.sort,
         })),
@@ -2317,6 +2377,31 @@ export const Actions = {
     },
   }),
 
+  setViewColumnWidths: defineAction({
+    description:
+      "Saves the drag-adjusted column widths of a view definition (px widths keyed by column identity: date, cat:<category>, item:<id>, duty:<id>, target, day). Only the widths are updated; the rest of the view definition is untouched.",
+    request: z.object({
+      viewId: z.number(),
+      widths: z.record(z.string(), z.number()),
+    }),
+    response: okResponse,
+    async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
+      const db = ctx.db<typeof schema>();
+      const clean: Record<string, number> = {};
+      for (const [k, v] of Object.entries(args.widths)) {
+        if (typeof v === "number" && Number.isFinite(v)) {
+          clean[k] = Math.min(800, Math.max(48, Math.round(v)));
+        }
+      }
+      await db
+        .update(schema.viewDefinitions)
+        .set({ widthsJson: JSON.stringify(clean) })
+        .where(eq(schema.viewDefinitions.id, args.viewId));
+      ctx.invalidateQueries();
+      return { ok: true as const };
+    },
+  }),
+
   deleteView: defineAction({
     description: "Deletes a view definition.",
     request: z.object({ id: z.number() }),
@@ -2386,6 +2471,592 @@ export const Actions = {
       await db
         .delete(schema.publications)
         .where(eq(schema.publications.id, args.id));
+      ctx.invalidateQueries();
+      return { ok: true as const };
+    },
+  }),
+
+  // ---------------- Phase 3: import / templates / link / entitlements ----
+
+  importEvents: defineAction({
+    description:
+      "Bulk-imports events parsed from a CSV / spreadsheet paste (Phase 3). Each row is already column-mapped and normalized by the client; rows without a title or a valid YYYY-MM-DD date are skipped and reported. Assignee names resolve to registered people when the name matches, otherwise they are kept as free text; a location name resolves to a registered location when it matches, otherwise it is kept as free text.",
+    request: z.object({
+      rows: z
+        .array(
+          z.object({
+            title: z.string(),
+            category: z.string().default("行事"),
+            startsOn: z.string(),
+            endsOn: z.string().nullable().default(null),
+            startsAt: z.string().nullable().default(null),
+            endsAt: z.string().nullable().default(null),
+            locationName: z.string().nullable().default(null),
+            assigneeNames: z.array(z.string()).default([]),
+            leaveType: z.string().nullable().default(null),
+            description: z.string().default(""),
+          }),
+        )
+        .max(1000),
+    }),
+    response: z.object({
+      created: z.number(),
+      skipped: z.number(),
+      errors: z.array(z.object({ row: z.number(), reason: z.string() })),
+    }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const peopleRows = await db.select().from(schema.people);
+      const personByName = new Map(peopleRows.map((p) => [p.name, p.id]));
+      const locRows = await db.select().from(schema.locations);
+      const locByName = new Map(locRows.map((l) => [l.name, l.id]));
+      const dateOk = (s: string) => /^\d{4}-\d{2}-\d{2}$/.test(s);
+      let created = 0;
+      const errors: { row: number; reason: string }[] = [];
+      for (let i = 0; i < args.rows.length; i++) {
+        const r = args.rows[i]!;
+        const title = r.title.trim();
+        if (!title) {
+          errors.push({ row: i + 1, reason: "件名が空です" });
+          continue;
+        }
+        if (!dateOk(r.startsOn)) {
+          errors.push({ row: i + 1, reason: `日付が解釈できません（${r.startsOn}）` });
+          continue;
+        }
+        const endsOn = r.endsOn && dateOk(r.endsOn) && r.endsOn >= r.startsOn ? r.endsOn : r.startsOn;
+        const locName = r.locationName?.trim() || null;
+        const locationId = locName != null ? (locByName.get(locName) ?? null) : null;
+        const [row] = await db
+          .insert(schema.events)
+          .values({
+            title,
+            category: r.category || "行事",
+            datePrecision: endsOn > r.startsOn ? "range" : "day",
+            startsOn: r.startsOn,
+            endsOn,
+            startsAt: r.startsAt,
+            endsAt: r.endsAt,
+            isAllDay: r.startsAt ? 0 : 1,
+            slot: "all_day",
+            locationId,
+            locationText: locName != null && locationId == null ? locName : null,
+            leaveType: r.category === "休暇" ? r.leaveType : null,
+            description: r.description ?? "",
+            certainty: "confirmed",
+            visibility: "staff_only",
+          })
+          .returning({ id: schema.events.id });
+        const role = r.category === "休暇" ? "取得者" : r.category === "出張" ? "出張者" : "担当";
+        for (const name of r.assigneeNames) {
+          const n = name.trim();
+          if (!n) continue;
+          const pid = personByName.get(n) ?? null;
+          await db.insert(schema.eventAssignees).values({
+            eventId: row!.id,
+            personId: pid,
+            freeTextName: pid == null ? n : null,
+            role,
+          });
+        }
+        created++;
+      }
+      ctx.invalidateQueries();
+      return { created, skipped: errors.length, errors };
+    },
+  }),
+
+  exportTemplate: defineAction({
+    description:
+      "Exports the school's whole definition set (target axes, item definitions with symbol legends, duty definitions, period patterns, views, leave types and the applied preset) as a portable JSON template. View columns are expressed with item keys and duty names instead of local ids so another school can import the file.",
+    request: z.object({}),
+    response: z.object({ templateJson: z.string() }),
+    async handler(ctx) {
+      const db = ctx.db<typeof schema>();
+      const settingsRow = await loadSettings(ctx);
+      const groupRows = await db.select().from(schema.targetGroups).orderBy(asc(schema.targetGroups.sort));
+      const targetRows = await db.select().from(schema.targets).orderBy(asc(schema.targets.sort));
+      const itemRows = await db.select().from(schema.itemDefinitions).orderBy(asc(schema.itemDefinitions.sort));
+      const optionRows = await db.select().from(schema.itemOptions).orderBy(asc(schema.itemOptions.sort));
+      const dutyRows = await db.select().from(schema.dutyDefinitions).orderBy(asc(schema.dutyDefinitions.sort));
+      const memberRows = await db.select().from(schema.rotationMembers).orderBy(asc(schema.rotationMembers.sort));
+      const peopleRows = await db.select().from(schema.people);
+      const personName = new Map(peopleRows.map((p) => [p.id, p.name]));
+      const patternRows = await db.select().from(schema.periodPatterns).orderBy(asc(schema.periodPatterns.sort));
+      const periodRows = await db.select().from(schema.periodDefinitions).orderBy(asc(schema.periodDefinitions.sort));
+      const viewRows = await db.select().from(schema.viewDefinitions).orderBy(asc(schema.viewDefinitions.sort));
+      const groupKey = new Map(groupRows.map((g) => [g.id, g.key]));
+      const itemKey = new Map(itemRows.map((i) => [i.id, i.key]));
+      const dutyName = new Map(dutyRows.map((d) => [d.id, d.name]));
+      const views = viewRows.map((v) => {
+        let columns: Record<string, unknown>[] = [];
+        try {
+          const parsed = JSON.parse(v.columnsJson) as Record<string, unknown>[];
+          if (Array.isArray(parsed)) {
+            columns = parsed.map((c) => {
+              if (c.kind === "daily_item" && typeof c.itemId === "number") {
+                return { kind: "daily_item", itemKey: itemKey.get(c.itemId) ?? null, label: c.label };
+              }
+              if (c.kind === "duty" && typeof c.dutyId === "number") {
+                return { kind: "duty", dutyName: dutyName.get(c.dutyId) ?? null, label: c.label };
+              }
+              return { kind: "category", category: c.category ?? "行事", label: c.label };
+            });
+          }
+        } catch {
+          columns = [];
+        }
+        return {
+          name: v.name,
+          layout: v.layout,
+          audience: v.audience,
+          printJson: v.printJson,
+          sort: v.sort,
+          columns,
+        };
+      });
+      const template = {
+        format: "school-schedule-template",
+        version: 1,
+        settings: {
+          presetApplied: settingsRow.presetApplied,
+          leaveTypes: settingsRow.leaveTypes,
+        },
+        targetGroups: groupRows.map((g) => ({
+          key: g.key,
+          name: g.name,
+          sort: g.sort,
+          targets: targetRows
+            .filter((t) => t.groupId === g.id)
+            .map((t) => ({ name: t.name, sort: t.sort })),
+        })),
+        items: itemRows.map((i) => ({
+          key: i.key,
+          name: i.name,
+          valueType: i.valueType,
+          targetGroupKey: i.targetGroupId != null ? (groupKey.get(i.targetGroupId) ?? null) : null,
+          granularity: i.granularity,
+          defaultVisibility: i.defaultVisibility,
+          isAggregatable: i.isAggregatable,
+          sort: i.sort,
+          options: optionRows
+            .filter((o) => o.itemDefinitionId === i.id)
+            .map((o) => ({ code: o.code, label: o.label, meaning: o.meaning, countsAs: o.countsAs, sort: o.sort })),
+        })),
+        duties: dutyRows.map((d) => ({
+          name: d.name,
+          granularity: d.granularity,
+          applicablePeriod: d.applicablePeriod,
+          startsOn: d.startsOn,
+          endsOn: d.endsOn,
+          sort: d.sort,
+          memberNames: memberRows
+            .filter((m) => m.dutyDefinitionId === d.id)
+            .map((m) => (m.personId != null ? (personName.get(m.personId) ?? m.freeTextName ?? "") : (m.freeTextName ?? "")))
+            .filter((n) => n !== ""),
+        })),
+        periodPatterns: patternRows.map((p) => ({
+          code: p.code,
+          name: p.name,
+          sort: p.sort,
+          periods: periodRows
+            .filter((d) => d.patternId === p.id)
+            .map((d) => ({ periodNo: d.periodNo, label: d.label, startsAt: d.startsAt, endsAt: d.endsAt, sort: d.sort })),
+        })),
+        views,
+      };
+      return { templateJson: JSON.stringify(template, null, 2) };
+    },
+  }),
+
+  importTemplate: defineAction({
+    description:
+      "Imports a definition template JSON (as produced by exportTemplate) into this school. Definitions that already exist (same key / name / code) are never duplicated or overwritten; missing targets inside an existing axis are added. View columns are re-resolved from item keys and duty names; columns that cannot be resolved are dropped. Events and daily data are never touched.",
+    request: z.object({ templateJson: z.string().min(2) }),
+    response: z.object({
+      ok: z.literal(true),
+      createdGroups: z.number(),
+      createdItems: z.number(),
+      createdDuties: z.number(),
+      createdPatterns: z.number(),
+      createdViews: z.number(),
+      skipped: z.number(),
+    }),
+    async handler(ctx, args): Promise<{
+      ok: true;
+      createdGroups: number;
+      createdItems: number;
+      createdDuties: number;
+      createdPatterns: number;
+      createdViews: number;
+      skipped: number;
+    }> {
+      const db = ctx.db<typeof schema>();
+      let tpl: Record<string, unknown>;
+      try {
+        tpl = JSON.parse(args.templateJson) as Record<string, unknown>;
+      } catch {
+        throw new Error("JSONとして読み取れませんでした");
+      }
+      if (tpl.format !== "school-schedule-template") {
+        throw new Error("このアプリのテンプレート形式ではありません（format が一致しません）");
+      }
+      const arr = (v: unknown): Record<string, unknown>[] =>
+        Array.isArray(v) ? (v as Record<string, unknown>[]) : [];
+      const str = (v: unknown, fallback = ""): string =>
+        typeof v === "string" ? v : fallback;
+      let createdGroups = 0;
+      let createdItems = 0;
+      let createdDuties = 0;
+      let createdPatterns = 0;
+      let createdViews = 0;
+      let skipped = 0;
+
+      // settings part: leave types only (school name / year stay local)
+      const tSettings = (tpl.settings ?? {}) as Record<string, unknown>;
+      if (Array.isArray(tSettings.leaveTypes) && tSettings.leaveTypes.length > 0) {
+        await loadSettings(ctx);
+        await db
+          .update(schema.settings)
+          .set({ leaveTypesJson: JSON.stringify(tSettings.leaveTypes) })
+          .where(eq(schema.settings.id, 1));
+      }
+
+      // target groups + targets (by key; missing targets are added)
+      const groupIdByKey = new Map<string, number>();
+      for (const g of await db.select().from(schema.targetGroups)) groupIdByKey.set(g.key, g.id);
+      for (const g of arr(tpl.targetGroups)) {
+        const key = str(g.key);
+        if (!key) continue;
+        let gid = groupIdByKey.get(key);
+        if (gid == null) {
+          const [row] = await db
+            .insert(schema.targetGroups)
+            .values({ key, name: str(g.name, key), sort: groupIdByKey.size })
+            .returning({ id: schema.targetGroups.id });
+          gid = row!.id;
+          groupIdByKey.set(key, gid);
+          createdGroups++;
+        }
+        const existingTargets = await db.select().from(schema.targets).where(eq(schema.targets.groupId, gid));
+        const names = new Set(existingTargets.map((t) => t.name));
+        const tlist = arr(g.targets);
+        for (let i = 0; i < tlist.length; i++) {
+          const name = str(tlist[i]!.name);
+          if (!name || names.has(name)) continue;
+          await db.insert(schema.targets).values({ groupId: gid, name, sort: existingTargets.length + i });
+          names.add(name);
+        }
+      }
+
+      // items + options (by key)
+      const itemIdByKey = new Map<string, number>();
+      for (const i of await db.select().from(schema.itemDefinitions)) itemIdByKey.set(i.key, i.id);
+      for (const it of arr(tpl.items)) {
+        const key = str(it.key);
+        if (!key) continue;
+        if (itemIdByKey.has(key)) {
+          skipped++;
+          continue;
+        }
+        const tgKey = typeof it.targetGroupKey === "string" ? it.targetGroupKey : null;
+        const [row] = await db
+          .insert(schema.itemDefinitions)
+          .values({
+            key,
+            name: str(it.name, key),
+            valueType: str(it.valueType, "text"),
+            targetGroupId: tgKey != null ? (groupIdByKey.get(tgKey) ?? null) : null,
+            granularity: str(it.granularity, "day"),
+            defaultVisibility: str(it.defaultVisibility, "staff_only"),
+            isAggregatable: it.isAggregatable === 1 || it.isAggregatable === true ? 1 : 0,
+            sort: itemIdByKey.size,
+          })
+          .returning({ id: schema.itemDefinitions.id });
+        itemIdByKey.set(key, row!.id);
+        const opts = arr(it.options);
+        for (let i = 0; i < opts.length; i++) {
+          const o = opts[i]!;
+          if (!str(o.code)) continue;
+          await db.insert(schema.itemOptions).values({
+            itemDefinitionId: row!.id,
+            code: str(o.code),
+            label: str(o.label, str(o.code)),
+            meaning: str(o.meaning),
+            countsAs: o.countsAs === 1 || o.countsAs === true ? 1 : 0,
+            sort: i,
+          });
+        }
+        createdItems++;
+      }
+
+      // duties (by name); members resolve against existing people by name
+      const peopleRows = await db.select().from(schema.people);
+      const personByName = new Map(peopleRows.map((p) => [p.name, p.id]));
+      const dutyIdByName = new Map<string, number>();
+      for (const d of await db.select().from(schema.dutyDefinitions)) dutyIdByName.set(d.name, d.id);
+      for (const d of arr(tpl.duties)) {
+        const name = str(d.name);
+        if (!name) continue;
+        if (dutyIdByName.has(name)) {
+          skipped++;
+          continue;
+        }
+        const [row] = await db
+          .insert(schema.dutyDefinitions)
+          .values({
+            name,
+            granularity: str(d.granularity, "day"),
+            applicablePeriod: str(d.applicablePeriod, "all_year"),
+            startsOn: typeof d.startsOn === "string" ? d.startsOn : null,
+            endsOn: typeof d.endsOn === "string" ? d.endsOn : null,
+            sort: dutyIdByName.size,
+          })
+          .returning({ id: schema.dutyDefinitions.id });
+        dutyIdByName.set(name, row!.id);
+        const memberNames = Array.isArray(d.memberNames) ? d.memberNames : [];
+        let mi = 0;
+        for (const mn of memberNames) {
+          if (typeof mn !== "string") continue;
+          const pid = personByName.get(mn);
+          if (pid == null) continue;
+          await db.insert(schema.rotationMembers).values({ dutyDefinitionId: row!.id, personId: pid, sort: mi++ });
+        }
+        createdDuties++;
+      }
+
+      // period patterns (by code)
+      const patternCodes = new Set((await db.select().from(schema.periodPatterns)).map((p) => p.code));
+      for (const p of arr(tpl.periodPatterns)) {
+        const code = str(p.code);
+        if (!code) continue;
+        if (patternCodes.has(code)) {
+          skipped++;
+          continue;
+        }
+        const [row] = await db
+          .insert(schema.periodPatterns)
+          .values({ code, name: str(p.name, code), sort: patternCodes.size })
+          .returning({ id: schema.periodPatterns.id });
+        patternCodes.add(code);
+        const periods = arr(p.periods);
+        for (let i = 0; i < periods.length; i++) {
+          const pd = periods[i]!;
+          await db.insert(schema.periodDefinitions).values({
+            patternId: row!.id,
+            periodNo: typeof pd.periodNo === "number" ? pd.periodNo : i,
+            label: str(pd.label),
+            startsAt: typeof pd.startsAt === "string" ? pd.startsAt : null,
+            endsAt: typeof pd.endsAt === "string" ? pd.endsAt : null,
+            sort: i,
+          });
+        }
+        createdPatterns++;
+      }
+
+      // views (by name); columns re-resolved from keys / names
+      const viewNames = new Set((await db.select().from(schema.viewDefinitions)).map((v) => v.name));
+      for (const v of arr(tpl.views)) {
+        const name = str(v.name);
+        if (!name) continue;
+        if (viewNames.has(name)) {
+          skipped++;
+          continue;
+        }
+        const cols: Record<string, unknown>[] = [];
+        for (const c of arr(v.columns)) {
+          if (c.kind === "daily_item") {
+            const ik = typeof c.itemKey === "string" ? c.itemKey : null;
+            const iid = ik != null ? itemIdByKey.get(ik) : undefined;
+            if (iid == null) continue;
+            cols.push({ kind: "daily_item", itemId: iid, label: str(c.label) });
+          } else if (c.kind === "duty") {
+            const dn = typeof c.dutyName === "string" ? c.dutyName : null;
+            const did = dn != null ? dutyIdByName.get(dn) : undefined;
+            if (did == null) continue;
+            cols.push({ kind: "duty", dutyId: did, label: str(c.label) });
+          } else {
+            cols.push({ kind: "category", category: str(c.category, "行事"), label: str(c.label) });
+          }
+        }
+        await db.insert(schema.viewDefinitions).values({
+          name,
+          layout: str(v.layout, "month_rows"),
+          audience: str(v.audience, "staff"),
+          columnsJson: JSON.stringify(cols),
+          printJson: str(v.printJson, "{}"),
+          sort: viewNames.size,
+        });
+        viewNames.add(name);
+        createdViews++;
+      }
+
+      ctx.invalidateQueries();
+      return {
+        ok: true as const,
+        createdGroups,
+        createdItems,
+        createdDuties,
+        createdPatterns,
+        createdViews,
+        skipped,
+      };
+    },
+  }),
+
+  saveLinkSettings: defineAction({
+    description:
+      "Saves the school-timetable link settings (Phase 3, DESIGN §10.2): standalone / linked mode and, per master kind (people, target axes, period patterns), whether the master is kept locally or conceptually referenced from the linked product. The prototype stores settings and name-matching records only; no real federation or SSO is performed.",
+    request: z.object({
+      linkMode: z.enum(["standalone", "linked"]),
+      peopleSource: z.enum(["local", "linked"]),
+      targetsSource: z.enum(["local", "linked"]),
+      periodsSource: z.enum(["local", "linked"]),
+    }),
+    response: okResponse,
+    async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
+      const db = ctx.db<typeof schema>();
+      await loadSettings(ctx);
+      await db
+        .update(schema.settings)
+        .set({
+          linkMode: args.linkMode,
+          peopleSource: args.peopleSource,
+          targetsSource: args.targetsSource,
+          periodsSource: args.periodsSource,
+        })
+        .where(eq(schema.settings.id, 1));
+      ctx.invalidateQueries();
+      return { ok: true as const };
+    },
+  }),
+
+  upsertMasterLink: defineAction({
+    description:
+      "Creates or updates one name-matching record between a local master entry (person, grade target, or period pattern) and its counterpart in the linked product, identified by free-text name / external id.",
+    request: z.object({
+      kind: z.enum(["people", "grade", "period"]),
+      localKey: z.string().min(1),
+      localName: z.string().default(""),
+      linkedName: z.string().default(""),
+      linkedId: z.string().default(""),
+      status: z.enum(["matched", "local_only", "unmatched"]).default("unmatched"),
+    }),
+    response: idResponse,
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const existing = await db
+        .select()
+        .from(schema.masterLinks)
+        .where(
+          and(
+            eq(schema.masterLinks.kind, args.kind),
+            eq(schema.masterLinks.localKey, args.localKey),
+          ),
+        )
+        .limit(1);
+      if (existing.length > 0) {
+        await db
+          .update(schema.masterLinks)
+          .set({
+            localName: args.localName,
+            linkedName: args.linkedName,
+            linkedId: args.linkedId,
+            status: args.status,
+          })
+          .where(eq(schema.masterLinks.id, existing[0]!.id));
+        ctx.invalidateQueries();
+        return { id: existing[0]!.id };
+      }
+      const [row] = await db
+        .insert(schema.masterLinks)
+        .values({
+          kind: args.kind,
+          localKey: args.localKey,
+          localName: args.localName,
+          linkedName: args.linkedName,
+          linkedId: args.linkedId,
+          status: args.status,
+        })
+        .returning({ id: schema.masterLinks.id });
+      ctx.invalidateQueries();
+      return { id: row!.id };
+    },
+  }),
+
+  deleteMasterLink: defineAction({
+    description: "Deletes one master name-matching record.",
+    request: z.object({ id: z.number() }),
+    response: okResponse,
+    async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
+      const db = ctx.db<typeof schema>();
+      await db.delete(schema.masterLinks).where(eq(schema.masterLinks.id, args.id));
+      ctx.invalidateQueries();
+      return { ok: true as const };
+    },
+  }),
+
+  upsertEntitlement: defineAction({
+    description:
+      "Creates or updates one product entitlement row (school × product × plan × status × optional period). The event_schedule row for the current school governs whether the schedule is editable; the timetable row governs whether link mode can be used. No billing is performed.",
+    request: z.object({
+      id: z.number().nullable().default(null),
+      schoolName: z.string().default(""),
+      product: z.enum(["event_schedule", "timetable"]),
+      plan: z.string().default("standard"),
+      status: z.enum(["active", "trial", "suspended", "none"]).default("active"),
+      startsOn: z.string().nullable().default(null),
+      endsOn: z.string().nullable().default(null),
+      note: z.string().default(""),
+      sort: z.number().default(0),
+    }),
+    response: idResponse,
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      if (args.id != null) {
+        await db
+          .update(schema.productEntitlements)
+          .set({
+            schoolName: args.schoolName,
+            product: args.product,
+            plan: args.plan,
+            status: args.status,
+            startsOn: args.startsOn,
+            endsOn: args.endsOn,
+            note: args.note,
+            sort: args.sort,
+          })
+          .where(eq(schema.productEntitlements.id, args.id));
+        ctx.invalidateQueries();
+        return { id: args.id };
+      }
+      const [row] = await db
+        .insert(schema.productEntitlements)
+        .values({
+          schoolName: args.schoolName,
+          product: args.product,
+          plan: args.plan,
+          status: args.status,
+          startsOn: args.startsOn,
+          endsOn: args.endsOn,
+          note: args.note,
+          sort: args.sort,
+        })
+        .returning({ id: schema.productEntitlements.id });
+      ctx.invalidateQueries();
+      return { id: row!.id };
+    },
+  }),
+
+  deleteEntitlement: defineAction({
+    description: "Deletes one product entitlement row.",
+    request: z.object({ id: z.number() }),
+    response: okResponse,
+    async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
+      const db = ctx.db<typeof schema>();
+      await db
+        .delete(schema.productEntitlements)
+        .where(eq(schema.productEntitlements.id, args.id));
       ctx.invalidateQueries();
       return { ok: true as const };
     },

@@ -8,6 +8,12 @@ VISIBILITY_OPTIONS,
 type Bootstrap,
 type ColumnDef,
 } from "./lib";
+import {
+  EntitlementSection,
+  ImportSection,
+  LinkSection,
+  TemplateSection,
+} from "./Phase3Sections";
 
 const inputCls =
   "rounded border border-[var(--border)] bg-[var(--surface)] px-2 py-1.5 text-sm";
@@ -197,6 +203,10 @@ export function SettingsPanel({
       </Section>
 
       <Section title="人（教職員・担当者候補）">
+        <p className="mb-2 text-xs text-[var(--dim)]">
+          マスタの出所：{bootstrap.settings.peopleSource === "linked" ? "参照（school-timetable）" : "自前（このアプリで保持）"}
+          {bootstrap.settings.linkMode === "linked" ? "／連携モード" : "／単独モード"}（変更は下の「school-timetable連携」から）
+        </p>
         <ul className="mb-2 flex flex-col gap-1 text-sm">
           {bootstrap.people.map((p) => (
             <li key={p.id} className="flex items-center gap-2">
@@ -554,6 +564,10 @@ export function SettingsPanel({
       </Section>
 
       <Section title="対象軸（学年・部・バス便など）">
+        <p className="mb-2 text-xs text-[var(--dim)]">
+          マスタの出所：{bootstrap.settings.targetsSource === "linked" ? "参照（school-timetable）" : "自前（このアプリで保持）"}
+          {bootstrap.settings.linkMode === "linked" ? "／連携モード" : "／単独モード"}（変更は下の「school-timetable連携」から）
+        </p>
         {bootstrap.targetGroups.map((g) => (
           <div key={g.id} className="mb-3">
             <div className="flex items-center gap-2 text-sm">
@@ -990,6 +1004,10 @@ export function SettingsPanel({
       </Section>
 
       <Section title="時限・日課パターン">
+        <p className="mb-2 text-xs text-[var(--dim)]">
+          マスタの出所：{bootstrap.settings.periodsSource === "linked" ? "参照（school-timetable）" : "自前（このアプリで保持）"}
+          {bootstrap.settings.linkMode === "linked" ? "／連携モード" : "／単独モード"}（変更は下の「school-timetable連携」から）
+        </p>
         {bootstrap.periodPatterns.map((p) => (
           <div key={p.id} className="mb-2 text-sm">
             <button
@@ -1406,6 +1424,11 @@ export function SettingsPanel({
           </ul>
         )}
       </Section>
+
+      <ImportSection bootstrap={bootstrap} />
+      <TemplateSection bootstrap={bootstrap} />
+      <LinkSection bootstrap={bootstrap} />
+      <EntitlementSection bootstrap={bootstrap} />
     </div>
   );
 }

@@ -2065,6 +2065,132 @@ function handleIntersectionResults(result, left, right) {
   result.value = merged.data;
   return result;
 }
+var $ZodRecord = /* @__PURE__ */ $constructor("$ZodRecord", (inst, def) => {
+  $ZodType.init(inst, def);
+  inst._zod.parse = (payload, ctx) => {
+    const input = payload.value;
+    if (!isPlainObject(input)) {
+      payload.issues.push({
+        expected: "record",
+        code: "invalid_type",
+        input,
+        inst
+      });
+      return payload;
+    }
+    const proms = [];
+    const values = def.keyType._zod.values;
+    if (values) {
+      payload.value = {};
+      const recordKeys = new Set;
+      for (const key of values) {
+        if (typeof key === "string" || typeof key === "number" || typeof key === "symbol") {
+          recordKeys.add(typeof key === "number" ? key.toString() : key);
+          const keyResult = def.keyType._zod.run({ value: key, issues: [] }, ctx);
+          if (keyResult instanceof Promise) {
+            throw new Error("Async schemas not supported in object keys currently");
+          }
+          if (keyResult.issues.length) {
+            payload.issues.push({
+              code: "invalid_key",
+              origin: "record",
+              issues: keyResult.issues.map((iss) => finalizeIssue(iss, ctx, config())),
+              input: key,
+              path: [key],
+              inst
+            });
+            continue;
+          }
+          const outKey = keyResult.value;
+          const result = def.valueType._zod.run({ value: input[key], issues: [] }, ctx);
+          if (result instanceof Promise) {
+            proms.push(result.then((result) => {
+              if (result.issues.length) {
+                payload.issues.push(...prefixIssues(key, result.issues));
+              }
+              payload.value[outKey] = result.value;
+            }));
+          } else {
+            if (result.issues.length) {
+              payload.issues.push(...prefixIssues(key, result.issues));
+            }
+            payload.value[outKey] = result.value;
+          }
+        }
+      }
+      let unrecognized;
+      for (const key in input) {
+        if (!recordKeys.has(key)) {
+          unrecognized = unrecognized ?? [];
+          unrecognized.push(key);
+        }
+      }
+      if (unrecognized && unrecognized.length > 0) {
+        payload.issues.push({
+          code: "unrecognized_keys",
+          input,
+          inst,
+          keys: unrecognized
+        });
+      }
+    } else {
+      payload.value = {};
+      for (const key of Reflect.ownKeys(input)) {
+        if (key === "__proto__")
+          continue;
+        if (!Object.prototype.propertyIsEnumerable.call(input, key))
+          continue;
+        let keyResult = def.keyType._zod.run({ value: key, issues: [] }, ctx);
+        if (keyResult instanceof Promise) {
+          throw new Error("Async schemas not supported in object keys currently");
+        }
+        const checkNumericKey = typeof key === "string" && number.test(key) && keyResult.issues.length;
+        if (checkNumericKey) {
+          const retryResult = def.keyType._zod.run({ value: Number(key), issues: [] }, ctx);
+          if (retryResult instanceof Promise) {
+            throw new Error("Async schemas not supported in object keys currently");
+          }
+          if (retryResult.issues.length === 0) {
+            keyResult = retryResult;
+          }
+        }
+        if (keyResult.issues.length) {
+          if (def.mode === "loose") {
+            payload.value[key] = input[key];
+          } else {
+            payload.issues.push({
+              code: "invalid_key",
+              origin: "record",
+              issues: keyResult.issues.map((iss) => finalizeIssue(iss, ctx, config())),
+              input: key,
+              path: [key],
+              inst
+            });
+          }
+          continue;
+        }
+        const result = def.valueType._zod.run({ value: input[key], issues: [] }, ctx);
+        if (result instanceof Promise) {
+          proms.push(result.then((result) => {
+            if (result.issues.length) {
+              payload.issues.push(...prefixIssues(key, result.issues));
+            }
+            payload.value[keyResult.value] = result.value;
+          }));
+        } else {
+          if (result.issues.length) {
+            payload.issues.push(...prefixIssues(key, result.issues));
+          }
+          payload.value[keyResult.value] = result.value;
+        }
+      }
+    }
+    if (proms.length) {
+      return Promise.all(proms).then(() => payload);
+    }
+    return payload;
+  };
+});
 var $ZodEnum = /* @__PURE__ */ $constructor("$ZodEnum", (inst, def) => {
   $ZodType.init(inst, def);
   const values = getEnumValues(def.entries);
@@ -3440,6 +3566,42 @@ var intersectionProcessor = (schema, ctx, json, params) => {
   ];
   json.allOf = allOf;
 };
+var recordProcessor = (schema, ctx, _json, params) => {
+  const json = _json;
+  const def = schema._zod.def;
+  json.type = "object";
+  const keyType = def.keyType;
+  const keyBag = keyType._zod.bag;
+  const patterns = keyBag?.patterns;
+  if (def.mode === "loose" && patterns && patterns.size > 0) {
+    const valueSchema = process(def.valueType, ctx, {
+      ...params,
+      path: [...params.path, "patternProperties", "*"]
+    });
+    json.patternProperties = {};
+    for (const pattern of patterns) {
+      json.patternProperties[pattern.source] = valueSchema;
+    }
+  } else {
+    if (ctx.target === "draft-07" || ctx.target === "draft-2020-12") {
+      json.propertyNames = process(def.keyType, ctx, {
+        ...params,
+        path: [...params.path, "propertyNames"]
+      });
+    }
+    json.additionalProperties = process(def.valueType, ctx, {
+      ...params,
+      path: [...params.path, "additionalProperties"]
+    });
+  }
+  const keyValues = keyType._zod.values;
+  if (keyValues) {
+    const validKeyValues = [...keyValues].filter((v) => typeof v === "string" || typeof v === "number");
+    if (validKeyValues.length > 0) {
+      json.required = validKeyValues;
+    }
+  }
+};
 var nullableProcessor = (schema, ctx, json, params) => {
   const def = schema._zod.def;
   const inner = process(def.innerType, ctx, params);
@@ -4119,6 +4281,29 @@ function intersection(left, right) {
     type: "intersection",
     left,
     right
+  });
+}
+var ZodRecord = /* @__PURE__ */ $constructor("ZodRecord", (inst, def) => {
+  $ZodRecord.init(inst, def);
+  ZodType.init(inst, def);
+  inst._zod.processJSONSchema = (ctx, json, params) => recordProcessor(inst, ctx, json, params);
+  inst.keyType = def.keyType;
+  inst.valueType = def.valueType;
+});
+function record(keyType, valueType, params) {
+  if (!valueType || !valueType._zod) {
+    return new ZodRecord({
+      type: "record",
+      keyType: string2(),
+      valueType: keyType,
+      ...normalizeParams(valueType)
+    });
+  }
+  return new ZodRecord({
+    type: "record",
+    keyType,
+    valueType,
+    ...normalizeParams(params)
   });
 }
 var ZodEnum = /* @__PURE__ */ $constructor("ZodEnum", (inst, def) => {
@@ -5559,7 +5744,31 @@ var settings = sqliteTable("settings", {
   schoolName: text("school_name").notNull().default(""),
   schoolYear: integer2("school_year").notNull().default(2026),
   presetApplied: text("preset_applied"),
-  leaveTypesJson: text("leave_types_json").notNull().default('["\u5E74\u4F11","\u75C5\u4F11","\u7279\u4F11","\u590F\u7279","\u770B\u8B77","\u8077\u5C02\u514D","\u632F\u4F11","\u305D\u306E\u4ED6"]')
+  leaveTypesJson: text("leave_types_json").notNull().default('["\u5E74\u4F11","\u75C5\u4F11","\u7279\u4F11","\u590F\u7279","\u770B\u8B77","\u8077\u5C02\u514D","\u632F\u4F11","\u305D\u306E\u4ED6"]'),
+  linkMode: text("link_mode").notNull().default("standalone"),
+  peopleSource: text("people_source").notNull().default("local"),
+  targetsSource: text("targets_source").notNull().default("local"),
+  periodsSource: text("periods_source").notNull().default("local")
+});
+var masterLinks = sqliteTable("master_links", {
+  id: integer2("id").primaryKey({ autoIncrement: true }),
+  kind: text("kind").notNull(),
+  localKey: text("local_key").notNull(),
+  localName: text("local_name").notNull().default(""),
+  linkedName: text("linked_name").notNull().default(""),
+  linkedId: text("linked_id").notNull().default(""),
+  status: text("status").notNull().default("unmatched")
+});
+var productEntitlements = sqliteTable("product_entitlements", {
+  id: integer2("id").primaryKey({ autoIncrement: true }),
+  schoolName: text("school_name").notNull().default(""),
+  product: text("product").notNull(),
+  plan: text("plan").notNull().default("standard"),
+  status: text("status").notNull().default("active"),
+  startsOn: text("starts_on"),
+  endsOn: text("ends_on"),
+  note: text("note").notNull().default(""),
+  sort: integer2("sort").notNull().default(0)
 });
 var people = sqliteTable("people", {
   id: integer2("id").primaryKey({ autoIncrement: true }),
@@ -5731,6 +5940,7 @@ var viewDefinitions = sqliteTable("view_definitions", {
   layout: text("layout").notNull().default("month_rows"),
   audience: text("audience").notNull().default("staff"),
   columnsJson: text("columns_json").notNull().default("[]"),
+  widthsJson: text("widths_json").notNull().default("{}"),
   printJson: text("print_json").notNull().default("{}"),
   sort: integer2("sort").notNull().default(0)
 });
@@ -5820,7 +6030,11 @@ async function loadSettings(ctx) {
       schoolName: "",
       schoolYear: 2026,
       presetApplied: null,
-      leaveTypes: [...DEFAULT_LEAVE_TYPES]
+      leaveTypes: [...DEFAULT_LEAVE_TYPES],
+      linkMode: "standalone",
+      peopleSource: "local",
+      targetsSource: "local",
+      periodsSource: "local"
     };
   }
   const r = rows[0];
@@ -5828,7 +6042,11 @@ async function loadSettings(ctx) {
     schoolName: r.schoolName,
     schoolYear: r.schoolYear,
     presetApplied: r.presetApplied,
-    leaveTypes: parseLeaveTypes(r.leaveTypesJson)
+    leaveTypes: parseLeaveTypes(r.leaveTypesJson),
+    linkMode: r.linkMode ?? "standalone",
+    peopleSource: r.peopleSource ?? "local",
+    targetsSource: r.targetsSource ?? "local",
+    periodsSource: r.periodsSource ?? "local"
   };
 }
 var personShape = object({
@@ -5884,6 +6102,7 @@ var viewShape = object({
   layout: string2(),
   audience: string2(),
   columnsJson: string2(),
+  widthsJson: string2(),
   printJson: string2(),
   sort: number2()
 });
@@ -6410,8 +6629,32 @@ var Actions = {
         schoolName: string2(),
         schoolYear: number2(),
         presetApplied: string2().nullable(),
-        leaveTypes: array(string2())
+        leaveTypes: array(string2()),
+        linkMode: string2(),
+        peopleSource: string2(),
+        targetsSource: string2(),
+        periodsSource: string2()
       }),
+      masterLinks: array(object({
+        id: number2(),
+        kind: string2(),
+        localKey: string2(),
+        localName: string2(),
+        linkedName: string2(),
+        linkedId: string2(),
+        status: string2()
+      })),
+      entitlements: array(object({
+        id: number2(),
+        schoolName: string2(),
+        product: string2(),
+        plan: string2(),
+        status: string2(),
+        startsOn: string2().nullable(),
+        endsOn: string2().nullable(),
+        note: string2(),
+        sort: number2()
+      })),
       people: array(personShape),
       locations: array(locationShape),
       holidays: array(object({ id: number2(), date: string2(), name: string2(), kind: string2() })),
@@ -6465,8 +6708,30 @@ var Actions = {
       const memberRows = await db.select().from(rotationMembers).orderBy(asc(rotationMembers.sort));
       const viewRows = await db.select().from(viewDefinitions).orderBy(asc(viewDefinitions.sort));
       const pubRows = await db.select().from(publications).orderBy(desc(publications.id));
+      const linkRows = await db.select().from(masterLinks).orderBy(asc(masterLinks.id));
+      const entRows = await db.select().from(productEntitlements).orderBy(asc(productEntitlements.sort), asc(productEntitlements.id));
       return {
         settings: settingsRow,
+        masterLinks: linkRows.map((l) => ({
+          id: l.id,
+          kind: l.kind,
+          localKey: l.localKey,
+          localName: l.localName,
+          linkedName: l.linkedName,
+          linkedId: l.linkedId,
+          status: l.status
+        })),
+        entitlements: entRows.map((e) => ({
+          id: e.id,
+          schoolName: e.schoolName,
+          product: e.product,
+          plan: e.plan,
+          status: e.status,
+          startsOn: e.startsOn,
+          endsOn: e.endsOn,
+          note: e.note,
+          sort: e.sort
+        })),
         people: peopleRows.map((p) => ({ id: p.id, name: p.name, role: p.role, sort: p.sort })),
         locations: locationRows.map((l) => ({ id: l.id, name: l.name, kind: l.kind, sort: l.sort })),
         holidays: holidayRows.map((h) => ({ id: h.id, date: h.date, name: h.name, kind: h.kind })),
@@ -6532,6 +6797,7 @@ var Actions = {
           layout: v.layout,
           audience: v.audience,
           columnsJson: v.columnsJson,
+          widthsJson: v.widthsJson,
           printJson: v.printJson,
           sort: v.sort
         })),
@@ -7595,6 +7861,26 @@ var Actions = {
       return { id: row.id };
     }
   }),
+  setViewColumnWidths: defineAction({
+    description: "Saves the drag-adjusted column widths of a view definition (px widths keyed by column identity: date, cat:<category>, item:<id>, duty:<id>, target, day). Only the widths are updated; the rest of the view definition is untouched.",
+    request: object({
+      viewId: number2(),
+      widths: record(string2(), number2())
+    }),
+    response: okResponse,
+    async handler(ctx, args) {
+      const db = ctx.db();
+      const clean = {};
+      for (const [k, v] of Object.entries(args.widths)) {
+        if (typeof v === "number" && Number.isFinite(v)) {
+          clean[k] = Math.min(800, Math.max(48, Math.round(v)));
+        }
+      }
+      await db.update(viewDefinitions).set({ widthsJson: JSON.stringify(clean) }).where(eq(viewDefinitions.id, args.viewId));
+      ctx.invalidateQueries();
+      return { ok: true };
+    }
+  }),
   deleteView: defineAction({
     description: "Deletes a view definition.",
     request: object({ id: number2() }),
@@ -7651,6 +7937,511 @@ var Actions = {
     async handler(ctx, args) {
       const db = ctx.db();
       await db.delete(publications).where(eq(publications.id, args.id));
+      ctx.invalidateQueries();
+      return { ok: true };
+    }
+  }),
+  importEvents: defineAction({
+    description: "Bulk-imports events parsed from a CSV / spreadsheet paste (Phase 3). Each row is already column-mapped and normalized by the client; rows without a title or a valid YYYY-MM-DD date are skipped and reported. Assignee names resolve to registered people when the name matches, otherwise they are kept as free text; a location name resolves to a registered location when it matches, otherwise it is kept as free text.",
+    request: object({
+      rows: array(object({
+        title: string2(),
+        category: string2().default("\u884C\u4E8B"),
+        startsOn: string2(),
+        endsOn: string2().nullable().default(null),
+        startsAt: string2().nullable().default(null),
+        endsAt: string2().nullable().default(null),
+        locationName: string2().nullable().default(null),
+        assigneeNames: array(string2()).default([]),
+        leaveType: string2().nullable().default(null),
+        description: string2().default("")
+      })).max(1000)
+    }),
+    response: object({
+      created: number2(),
+      skipped: number2(),
+      errors: array(object({ row: number2(), reason: string2() }))
+    }),
+    async handler(ctx, args) {
+      const db = ctx.db();
+      const peopleRows = await db.select().from(people);
+      const personByName = new Map(peopleRows.map((p) => [p.name, p.id]));
+      const locRows = await db.select().from(locations);
+      const locByName = new Map(locRows.map((l) => [l.name, l.id]));
+      const dateOk = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s);
+      let created = 0;
+      const errors = [];
+      for (let i = 0;i < args.rows.length; i++) {
+        const r = args.rows[i];
+        const title = r.title.trim();
+        if (!title) {
+          errors.push({ row: i + 1, reason: "\u4EF6\u540D\u304C\u7A7A\u3067\u3059" });
+          continue;
+        }
+        if (!dateOk(r.startsOn)) {
+          errors.push({ row: i + 1, reason: `\u65E5\u4ED8\u304C\u89E3\u91C8\u3067\u304D\u307E\u305B\u3093\uFF08${r.startsOn}\uFF09` });
+          continue;
+        }
+        const endsOn = r.endsOn && dateOk(r.endsOn) && r.endsOn >= r.startsOn ? r.endsOn : r.startsOn;
+        const locName = r.locationName?.trim() || null;
+        const locationId = locName != null ? locByName.get(locName) ?? null : null;
+        const [row] = await db.insert(events).values({
+          title,
+          category: r.category || "\u884C\u4E8B",
+          datePrecision: endsOn > r.startsOn ? "range" : "day",
+          startsOn: r.startsOn,
+          endsOn,
+          startsAt: r.startsAt,
+          endsAt: r.endsAt,
+          isAllDay: r.startsAt ? 0 : 1,
+          slot: "all_day",
+          locationId,
+          locationText: locName != null && locationId == null ? locName : null,
+          leaveType: r.category === "\u4F11\u6687" ? r.leaveType : null,
+          description: r.description ?? "",
+          certainty: "confirmed",
+          visibility: "staff_only"
+        }).returning({ id: events.id });
+        const role = r.category === "\u4F11\u6687" ? "\u53D6\u5F97\u8005" : r.category === "\u51FA\u5F35" ? "\u51FA\u5F35\u8005" : "\u62C5\u5F53";
+        for (const name of r.assigneeNames) {
+          const n = name.trim();
+          if (!n)
+            continue;
+          const pid = personByName.get(n) ?? null;
+          await db.insert(eventAssignees).values({
+            eventId: row.id,
+            personId: pid,
+            freeTextName: pid == null ? n : null,
+            role
+          });
+        }
+        created++;
+      }
+      ctx.invalidateQueries();
+      return { created, skipped: errors.length, errors };
+    }
+  }),
+  exportTemplate: defineAction({
+    description: "Exports the school's whole definition set (target axes, item definitions with symbol legends, duty definitions, period patterns, views, leave types and the applied preset) as a portable JSON template. View columns are expressed with item keys and duty names instead of local ids so another school can import the file.",
+    request: object({}),
+    response: object({ templateJson: string2() }),
+    async handler(ctx) {
+      const db = ctx.db();
+      const settingsRow = await loadSettings(ctx);
+      const groupRows = await db.select().from(targetGroups).orderBy(asc(targetGroups.sort));
+      const targetRows = await db.select().from(targets).orderBy(asc(targets.sort));
+      const itemRows = await db.select().from(itemDefinitions).orderBy(asc(itemDefinitions.sort));
+      const optionRows = await db.select().from(itemOptions).orderBy(asc(itemOptions.sort));
+      const dutyRows = await db.select().from(dutyDefinitions).orderBy(asc(dutyDefinitions.sort));
+      const memberRows = await db.select().from(rotationMembers).orderBy(asc(rotationMembers.sort));
+      const peopleRows = await db.select().from(people);
+      const personName = new Map(peopleRows.map((p) => [p.id, p.name]));
+      const patternRows = await db.select().from(periodPatterns).orderBy(asc(periodPatterns.sort));
+      const periodRows = await db.select().from(periodDefinitions).orderBy(asc(periodDefinitions.sort));
+      const viewRows = await db.select().from(viewDefinitions).orderBy(asc(viewDefinitions.sort));
+      const groupKey = new Map(groupRows.map((g) => [g.id, g.key]));
+      const itemKey = new Map(itemRows.map((i) => [i.id, i.key]));
+      const dutyName = new Map(dutyRows.map((d) => [d.id, d.name]));
+      const views = viewRows.map((v) => {
+        let columns = [];
+        try {
+          const parsed = JSON.parse(v.columnsJson);
+          if (Array.isArray(parsed)) {
+            columns = parsed.map((c) => {
+              if (c.kind === "daily_item" && typeof c.itemId === "number") {
+                return { kind: "daily_item", itemKey: itemKey.get(c.itemId) ?? null, label: c.label };
+              }
+              if (c.kind === "duty" && typeof c.dutyId === "number") {
+                return { kind: "duty", dutyName: dutyName.get(c.dutyId) ?? null, label: c.label };
+              }
+              return { kind: "category", category: c.category ?? "\u884C\u4E8B", label: c.label };
+            });
+          }
+        } catch {
+          columns = [];
+        }
+        return {
+          name: v.name,
+          layout: v.layout,
+          audience: v.audience,
+          printJson: v.printJson,
+          sort: v.sort,
+          columns
+        };
+      });
+      const template = {
+        format: "school-schedule-template",
+        version: 1,
+        settings: {
+          presetApplied: settingsRow.presetApplied,
+          leaveTypes: settingsRow.leaveTypes
+        },
+        targetGroups: groupRows.map((g) => ({
+          key: g.key,
+          name: g.name,
+          sort: g.sort,
+          targets: targetRows.filter((t) => t.groupId === g.id).map((t) => ({ name: t.name, sort: t.sort }))
+        })),
+        items: itemRows.map((i) => ({
+          key: i.key,
+          name: i.name,
+          valueType: i.valueType,
+          targetGroupKey: i.targetGroupId != null ? groupKey.get(i.targetGroupId) ?? null : null,
+          granularity: i.granularity,
+          defaultVisibility: i.defaultVisibility,
+          isAggregatable: i.isAggregatable,
+          sort: i.sort,
+          options: optionRows.filter((o) => o.itemDefinitionId === i.id).map((o) => ({ code: o.code, label: o.label, meaning: o.meaning, countsAs: o.countsAs, sort: o.sort }))
+        })),
+        duties: dutyRows.map((d) => ({
+          name: d.name,
+          granularity: d.granularity,
+          applicablePeriod: d.applicablePeriod,
+          startsOn: d.startsOn,
+          endsOn: d.endsOn,
+          sort: d.sort,
+          memberNames: memberRows.filter((m) => m.dutyDefinitionId === d.id).map((m) => m.personId != null ? personName.get(m.personId) ?? m.freeTextName ?? "" : m.freeTextName ?? "").filter((n) => n !== "")
+        })),
+        periodPatterns: patternRows.map((p) => ({
+          code: p.code,
+          name: p.name,
+          sort: p.sort,
+          periods: periodRows.filter((d) => d.patternId === p.id).map((d) => ({ periodNo: d.periodNo, label: d.label, startsAt: d.startsAt, endsAt: d.endsAt, sort: d.sort }))
+        })),
+        views
+      };
+      return { templateJson: JSON.stringify(template, null, 2) };
+    }
+  }),
+  importTemplate: defineAction({
+    description: "Imports a definition template JSON (as produced by exportTemplate) into this school. Definitions that already exist (same key / name / code) are never duplicated or overwritten; missing targets inside an existing axis are added. View columns are re-resolved from item keys and duty names; columns that cannot be resolved are dropped. Events and daily data are never touched.",
+    request: object({ templateJson: string2().min(2) }),
+    response: object({
+      ok: literal(true),
+      createdGroups: number2(),
+      createdItems: number2(),
+      createdDuties: number2(),
+      createdPatterns: number2(),
+      createdViews: number2(),
+      skipped: number2()
+    }),
+    async handler(ctx, args) {
+      const db = ctx.db();
+      let tpl;
+      try {
+        tpl = JSON.parse(args.templateJson);
+      } catch {
+        throw new Error("JSON\u3068\u3057\u3066\u8AAD\u307F\u53D6\u308C\u307E\u305B\u3093\u3067\u3057\u305F");
+      }
+      if (tpl.format !== "school-schedule-template") {
+        throw new Error("\u3053\u306E\u30A2\u30D7\u30EA\u306E\u30C6\u30F3\u30D7\u30EC\u30FC\u30C8\u5F62\u5F0F\u3067\u306F\u3042\u308A\u307E\u305B\u3093\uFF08format \u304C\u4E00\u81F4\u3057\u307E\u305B\u3093\uFF09");
+      }
+      const arr = (v) => Array.isArray(v) ? v : [];
+      const str = (v, fallback = "") => typeof v === "string" ? v : fallback;
+      let createdGroups = 0;
+      let createdItems = 0;
+      let createdDuties = 0;
+      let createdPatterns = 0;
+      let createdViews = 0;
+      let skipped = 0;
+      const tSettings = tpl.settings ?? {};
+      if (Array.isArray(tSettings.leaveTypes) && tSettings.leaveTypes.length > 0) {
+        await loadSettings(ctx);
+        await db.update(settings).set({ leaveTypesJson: JSON.stringify(tSettings.leaveTypes) }).where(eq(settings.id, 1));
+      }
+      const groupIdByKey = new Map;
+      for (const g of await db.select().from(targetGroups))
+        groupIdByKey.set(g.key, g.id);
+      for (const g of arr(tpl.targetGroups)) {
+        const key = str(g.key);
+        if (!key)
+          continue;
+        let gid = groupIdByKey.get(key);
+        if (gid == null) {
+          const [row] = await db.insert(targetGroups).values({ key, name: str(g.name, key), sort: groupIdByKey.size }).returning({ id: targetGroups.id });
+          gid = row.id;
+          groupIdByKey.set(key, gid);
+          createdGroups++;
+        }
+        const existingTargets = await db.select().from(targets).where(eq(targets.groupId, gid));
+        const names = new Set(existingTargets.map((t) => t.name));
+        const tlist = arr(g.targets);
+        for (let i = 0;i < tlist.length; i++) {
+          const name = str(tlist[i].name);
+          if (!name || names.has(name))
+            continue;
+          await db.insert(targets).values({ groupId: gid, name, sort: existingTargets.length + i });
+          names.add(name);
+        }
+      }
+      const itemIdByKey = new Map;
+      for (const i of await db.select().from(itemDefinitions))
+        itemIdByKey.set(i.key, i.id);
+      for (const it of arr(tpl.items)) {
+        const key = str(it.key);
+        if (!key)
+          continue;
+        if (itemIdByKey.has(key)) {
+          skipped++;
+          continue;
+        }
+        const tgKey = typeof it.targetGroupKey === "string" ? it.targetGroupKey : null;
+        const [row] = await db.insert(itemDefinitions).values({
+          key,
+          name: str(it.name, key),
+          valueType: str(it.valueType, "text"),
+          targetGroupId: tgKey != null ? groupIdByKey.get(tgKey) ?? null : null,
+          granularity: str(it.granularity, "day"),
+          defaultVisibility: str(it.defaultVisibility, "staff_only"),
+          isAggregatable: it.isAggregatable === 1 || it.isAggregatable === true ? 1 : 0,
+          sort: itemIdByKey.size
+        }).returning({ id: itemDefinitions.id });
+        itemIdByKey.set(key, row.id);
+        const opts = arr(it.options);
+        for (let i = 0;i < opts.length; i++) {
+          const o = opts[i];
+          if (!str(o.code))
+            continue;
+          await db.insert(itemOptions).values({
+            itemDefinitionId: row.id,
+            code: str(o.code),
+            label: str(o.label, str(o.code)),
+            meaning: str(o.meaning),
+            countsAs: o.countsAs === 1 || o.countsAs === true ? 1 : 0,
+            sort: i
+          });
+        }
+        createdItems++;
+      }
+      const peopleRows = await db.select().from(people);
+      const personByName = new Map(peopleRows.map((p) => [p.name, p.id]));
+      const dutyIdByName = new Map;
+      for (const d of await db.select().from(dutyDefinitions))
+        dutyIdByName.set(d.name, d.id);
+      for (const d of arr(tpl.duties)) {
+        const name = str(d.name);
+        if (!name)
+          continue;
+        if (dutyIdByName.has(name)) {
+          skipped++;
+          continue;
+        }
+        const [row] = await db.insert(dutyDefinitions).values({
+          name,
+          granularity: str(d.granularity, "day"),
+          applicablePeriod: str(d.applicablePeriod, "all_year"),
+          startsOn: typeof d.startsOn === "string" ? d.startsOn : null,
+          endsOn: typeof d.endsOn === "string" ? d.endsOn : null,
+          sort: dutyIdByName.size
+        }).returning({ id: dutyDefinitions.id });
+        dutyIdByName.set(name, row.id);
+        const memberNames = Array.isArray(d.memberNames) ? d.memberNames : [];
+        let mi = 0;
+        for (const mn of memberNames) {
+          if (typeof mn !== "string")
+            continue;
+          const pid = personByName.get(mn);
+          if (pid == null)
+            continue;
+          await db.insert(rotationMembers).values({ dutyDefinitionId: row.id, personId: pid, sort: mi++ });
+        }
+        createdDuties++;
+      }
+      const patternCodes = new Set((await db.select().from(periodPatterns)).map((p) => p.code));
+      for (const p of arr(tpl.periodPatterns)) {
+        const code = str(p.code);
+        if (!code)
+          continue;
+        if (patternCodes.has(code)) {
+          skipped++;
+          continue;
+        }
+        const [row] = await db.insert(periodPatterns).values({ code, name: str(p.name, code), sort: patternCodes.size }).returning({ id: periodPatterns.id });
+        patternCodes.add(code);
+        const periods = arr(p.periods);
+        for (let i = 0;i < periods.length; i++) {
+          const pd = periods[i];
+          await db.insert(periodDefinitions).values({
+            patternId: row.id,
+            periodNo: typeof pd.periodNo === "number" ? pd.periodNo : i,
+            label: str(pd.label),
+            startsAt: typeof pd.startsAt === "string" ? pd.startsAt : null,
+            endsAt: typeof pd.endsAt === "string" ? pd.endsAt : null,
+            sort: i
+          });
+        }
+        createdPatterns++;
+      }
+      const viewNames = new Set((await db.select().from(viewDefinitions)).map((v) => v.name));
+      for (const v of arr(tpl.views)) {
+        const name = str(v.name);
+        if (!name)
+          continue;
+        if (viewNames.has(name)) {
+          skipped++;
+          continue;
+        }
+        const cols = [];
+        for (const c of arr(v.columns)) {
+          if (c.kind === "daily_item") {
+            const ik = typeof c.itemKey === "string" ? c.itemKey : null;
+            const iid = ik != null ? itemIdByKey.get(ik) : undefined;
+            if (iid == null)
+              continue;
+            cols.push({ kind: "daily_item", itemId: iid, label: str(c.label) });
+          } else if (c.kind === "duty") {
+            const dn = typeof c.dutyName === "string" ? c.dutyName : null;
+            const did = dn != null ? dutyIdByName.get(dn) : undefined;
+            if (did == null)
+              continue;
+            cols.push({ kind: "duty", dutyId: did, label: str(c.label) });
+          } else {
+            cols.push({ kind: "category", category: str(c.category, "\u884C\u4E8B"), label: str(c.label) });
+          }
+        }
+        await db.insert(viewDefinitions).values({
+          name,
+          layout: str(v.layout, "month_rows"),
+          audience: str(v.audience, "staff"),
+          columnsJson: JSON.stringify(cols),
+          printJson: str(v.printJson, "{}"),
+          sort: viewNames.size
+        });
+        viewNames.add(name);
+        createdViews++;
+      }
+      ctx.invalidateQueries();
+      return {
+        ok: true,
+        createdGroups,
+        createdItems,
+        createdDuties,
+        createdPatterns,
+        createdViews,
+        skipped
+      };
+    }
+  }),
+  saveLinkSettings: defineAction({
+    description: "Saves the school-timetable link settings (Phase 3, DESIGN \xA710.2): standalone / linked mode and, per master kind (people, target axes, period patterns), whether the master is kept locally or conceptually referenced from the linked product. The prototype stores settings and name-matching records only; no real federation or SSO is performed.",
+    request: object({
+      linkMode: _enum(["standalone", "linked"]),
+      peopleSource: _enum(["local", "linked"]),
+      targetsSource: _enum(["local", "linked"]),
+      periodsSource: _enum(["local", "linked"])
+    }),
+    response: okResponse,
+    async handler(ctx, args) {
+      const db = ctx.db();
+      await loadSettings(ctx);
+      await db.update(settings).set({
+        linkMode: args.linkMode,
+        peopleSource: args.peopleSource,
+        targetsSource: args.targetsSource,
+        periodsSource: args.periodsSource
+      }).where(eq(settings.id, 1));
+      ctx.invalidateQueries();
+      return { ok: true };
+    }
+  }),
+  upsertMasterLink: defineAction({
+    description: "Creates or updates one name-matching record between a local master entry (person, grade target, or period pattern) and its counterpart in the linked product, identified by free-text name / external id.",
+    request: object({
+      kind: _enum(["people", "grade", "period"]),
+      localKey: string2().min(1),
+      localName: string2().default(""),
+      linkedName: string2().default(""),
+      linkedId: string2().default(""),
+      status: _enum(["matched", "local_only", "unmatched"]).default("unmatched")
+    }),
+    response: idResponse,
+    async handler(ctx, args) {
+      const db = ctx.db();
+      const existing = await db.select().from(masterLinks).where(and(eq(masterLinks.kind, args.kind), eq(masterLinks.localKey, args.localKey))).limit(1);
+      if (existing.length > 0) {
+        await db.update(masterLinks).set({
+          localName: args.localName,
+          linkedName: args.linkedName,
+          linkedId: args.linkedId,
+          status: args.status
+        }).where(eq(masterLinks.id, existing[0].id));
+        ctx.invalidateQueries();
+        return { id: existing[0].id };
+      }
+      const [row] = await db.insert(masterLinks).values({
+        kind: args.kind,
+        localKey: args.localKey,
+        localName: args.localName,
+        linkedName: args.linkedName,
+        linkedId: args.linkedId,
+        status: args.status
+      }).returning({ id: masterLinks.id });
+      ctx.invalidateQueries();
+      return { id: row.id };
+    }
+  }),
+  deleteMasterLink: defineAction({
+    description: "Deletes one master name-matching record.",
+    request: object({ id: number2() }),
+    response: okResponse,
+    async handler(ctx, args) {
+      const db = ctx.db();
+      await db.delete(masterLinks).where(eq(masterLinks.id, args.id));
+      ctx.invalidateQueries();
+      return { ok: true };
+    }
+  }),
+  upsertEntitlement: defineAction({
+    description: "Creates or updates one product entitlement row (school \xD7 product \xD7 plan \xD7 status \xD7 optional period). The event_schedule row for the current school governs whether the schedule is editable; the timetable row governs whether link mode can be used. No billing is performed.",
+    request: object({
+      id: number2().nullable().default(null),
+      schoolName: string2().default(""),
+      product: _enum(["event_schedule", "timetable"]),
+      plan: string2().default("standard"),
+      status: _enum(["active", "trial", "suspended", "none"]).default("active"),
+      startsOn: string2().nullable().default(null),
+      endsOn: string2().nullable().default(null),
+      note: string2().default(""),
+      sort: number2().default(0)
+    }),
+    response: idResponse,
+    async handler(ctx, args) {
+      const db = ctx.db();
+      if (args.id != null) {
+        await db.update(productEntitlements).set({
+          schoolName: args.schoolName,
+          product: args.product,
+          plan: args.plan,
+          status: args.status,
+          startsOn: args.startsOn,
+          endsOn: args.endsOn,
+          note: args.note,
+          sort: args.sort
+        }).where(eq(productEntitlements.id, args.id));
+        ctx.invalidateQueries();
+        return { id: args.id };
+      }
+      const [row] = await db.insert(productEntitlements).values({
+        schoolName: args.schoolName,
+        product: args.product,
+        plan: args.plan,
+        status: args.status,
+        startsOn: args.startsOn,
+        endsOn: args.endsOn,
+        note: args.note,
+        sort: args.sort
+      }).returning({ id: productEntitlements.id });
+      ctx.invalidateQueries();
+      return { id: row.id };
+    }
+  }),
+  deleteEntitlement: defineAction({
+    description: "Deletes one product entitlement row.",
+    request: object({ id: number2() }),
+    response: okResponse,
+    async handler(ctx, args) {
+      const db = ctx.db();
+      await db.delete(productEntitlements).where(eq(productEntitlements.id, args.id));
       ctx.invalidateQueries();
       return { ok: true };
     }

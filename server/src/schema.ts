@@ -20,6 +20,50 @@ export const settings = sqliteTable("settings", {
   leaveTypesJson: text("leave_types_json")
     .notNull()
     .default('["年休","病休","特休","夏特","看護","職専免","振休","その他"]'),
+  // Phase 3 (§10): link mode with school-timetable. standalone | linked.
+  // In this prototype the link is settings + name-matching records only;
+  // no real federation or SSO happens.
+  linkMode: text("link_mode").notNull().default("standalone"),
+  // Master provenance per kind: local (kept in this app) | linked
+  // (conceptually referenced from school-timetable).
+  peopleSource: text("people_source").notNull().default("local"),
+  targetsSource: text("targets_source").notNull().default("local"),
+  periodsSource: text("periods_source").notNull().default("local"),
+});
+
+// Phase 3 (§10.2): name-matching records between this app's masters and
+// the linked product's masters, prepared when link mode starts. The
+// linked side is identified by free-text name / external id only — the
+// prototype never contacts the other product.
+export const masterLinks = sqliteTable("master_links", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  // people | grade | period
+  kind: text("kind").notNull(),
+  // Local master identity (id as text) and its display name at match time.
+  localKey: text("local_key").notNull(),
+  localName: text("local_name").notNull().default(""),
+  linkedName: text("linked_name").notNull().default(""),
+  linkedId: text("linked_id").notNull().default(""),
+  // matched | local_only | unmatched
+  status: text("status").notNull().default("unmatched"),
+});
+
+// Phase 3 (§10.1): product entitlements, school × product × plan ×
+// status. This is the contract boundary between the two products; no
+// billing itself happens in the prototype.
+export const productEntitlements = sqliteTable("product_entitlements", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  schoolName: text("school_name").notNull().default(""),
+  // event_schedule | timetable
+  product: text("product").notNull(),
+  // free | standard | pro
+  plan: text("plan").notNull().default("standard"),
+  // active | trial | suspended | none
+  status: text("status").notNull().default("active"),
+  startsOn: text("starts_on"),
+  endsOn: text("ends_on"),
+  note: text("note").notNull().default(""),
+  sort: integer("sort").notNull().default(0),
 });
 
 export const people = sqliteTable("people", {
@@ -253,6 +297,10 @@ export const viewDefinitions = sqliteTable("view_definitions", {
   audience: text("audience").notNull().default("staff"),
   // JSON: [{kind:'events'|'category'|'daily_item'|'duty', category?, itemId?, dutyId?, label}]
   columnsJson: text("columns_json").notNull().default("[]"),
+  // JSON object of drag-adjusted column widths in px, keyed by column
+  // identity ("date", "cat:<category>", "item:<id>", "duty:<id>",
+  // "target", "day"). Columns without an entry use the default width.
+  widthsJson: text("widths_json").notNull().default("{}"),
   // JSON: {paper, orientation, showHeader}
   printJson: text("print_json").notNull().default("{}"),
   sort: integer("sort").notNull().default(0),

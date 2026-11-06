@@ -53,18 +53,7 @@ export const VISIBILITY_OPTIONS = [
   { value: "student", label: "生徒可" },
   { value: "public", label: "公開" },
 ];
-export const VIS_RANK: Record<string, number> = {
-  staff_only: 0,
-  guardian: 1,
-  student: 2,
-  public: 3,
-};
-export const AUDIENCE_RANK: Record<string, number> = {
-  staff: 0,
-  guardian: 1,
-  student: 2,
-  public: 3,
-};
+export { AUDIENCE_RANK, VIS_RANK, audienceRankOf } from "./audience";
 export const LAYOUTS = [
   { key: "month_rows", label: "L1 月・縦表" },
   { key: "week_rows", label: "L2 週・縦表" },
@@ -167,24 +156,7 @@ export function eventHeadline(
   }
   return e.title;
 }
-/**
- * Compresses an ordered list of target names into a range label.
- * ["1年","2年","3年","4年","5年","6年"] -> "1～6年" (shared suffix kept once),
- * ["1年","2年"] -> "1～2年", a single name is returned as-is.
- * Falls back to "first～last" when the names share no numeric+ suffix shape.
- */
-export function targetRangeLabel(names: string[]): string {
-  if (names.length === 0) return "";
-  if (names.length === 1) return names[0] ?? "";
-  const first = names[0] ?? "";
-  const last = names[names.length - 1] ?? "";
-  const fm = first.match(/^(\d+)(.*)$/);
-  const lm = last.match(/^(\d+)(.*)$/);
-  if (fm && lm && fm[2] !== "" && fm[2] === lm[2]) {
-    return `${fm[1]}～${last}`;
-  }
-  return `${first}～${last}`;
-}
+export { targetRangeLabel } from "./audience";
 // ---- Phase 3: entitlements & link mode (DESIGN §10) ----
 export type Entitlement = Bootstrap["entitlements"][number];
 export type MasterLink = Bootstrap["masterLinks"][number];

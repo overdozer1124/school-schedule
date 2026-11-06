@@ -256,7 +256,7 @@ export const dutyAssignments = sqliteTable("duty_assignments", {
   freeTextName: text("free_text_name"),
   note: text("note").notNull().default(""),
   isManualOverride: integer("is_manual_override").notNull().default(0),
-  // auto | manual | swap
+  // auto | manual | swap | substitute
   origin: text("origin").notNull().default("manual"),
 });
 

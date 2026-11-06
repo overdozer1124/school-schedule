@@ -50,6 +50,13 @@ export function SettingsPanel({
     onSuccess: invalidate,
   });
   const run = (fn: () => Promise<unknown>) => mut.mutate(fn);
+  // Server refusals (e.g. a symbol still used by daily values, a target
+  // still referenced) must be visible, not swallowed.
+  const errorText = mut.error
+    ? mut.error instanceof Error
+      ? mut.error.message
+      : String(mut.error)
+    : "";
 
   // school settings
   const [schoolName, setSchoolName] = useState(bootstrap.settings.schoolName);
@@ -134,6 +141,17 @@ export function SettingsPanel({
           予定表に戻る
         </button>
       </div>
+      {errorText && (
+        <div
+          role="alert"
+          className="fixed inset-x-2 bottom-2 z-50 mx-auto flex max-w-3xl items-start gap-2 rounded border border-[#b91c1c] bg-[var(--surface)] px-3 py-2 text-sm text-[#b91c1c] shadow-lg"
+        >
+          <span className="flex-1">保存できませんでした：{errorText}</span>
+          <button type="button" className={btnCls} onClick={() => mut.reset()}>
+            閉じる
+          </button>
+        </div>
+      )}
 
       <Section title="学校とプリセット">
         <div className="flex flex-wrap items-end gap-2">

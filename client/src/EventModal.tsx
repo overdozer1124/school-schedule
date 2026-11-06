@@ -165,6 +165,23 @@ export function EventModal({
     mutationFn: async () => {
       const payload = buildPayload();
       if (!payload.title) throw new Error("件名を入力してください");
+      // Same checks the server enforces, surfaced before the round trip.
+      if (payload.startsOn && payload.endsOn && payload.endsOn < payload.startsOn)
+        throw new Error("終了日が開始日より前になっています");
+      if (
+        payload.isAllDay === 0 &&
+        payload.startsAt &&
+        payload.endsAt &&
+        payload.endsAt < payload.startsAt &&
+        payload.endsOn === payload.startsOn
+      )
+        throw new Error("終了時刻が開始時刻より前になっています");
+      if (
+        payload.periodFrom != null &&
+        payload.periodTo != null &&
+        payload.periodTo < payload.periodFrom
+      )
+        throw new Error("終了時限が開始時限より前になっています");
       if (event == null) {
         await api.createEvent(payload);
       } else {

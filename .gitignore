@@ -11,3 +11,6 @@ audits/
 dist/
 .env
 .env.*
+*.tsbuildinfo
+client/dist/
+client/dist-cvm/

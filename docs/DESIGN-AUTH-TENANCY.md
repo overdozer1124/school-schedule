@@ -1,253 +1,285 @@
 # 認可・テナント分離 設計案（レビュー指摘 M-1／M-5）
 
-作成: 2026-11-06 / 状態: 設計案（要判断事項あり・未実装）
+作成: 2026-11-06 / 改訂: 2026-11-07（判断事項 D-1〜D-7 を荒木の回答で確定）/ 状態: 設計確定（未実装）
 対象: `docs/REVIEW-RESPONSE.md` の M-1（サーバー側の認証・認可・公開範囲フィルタ）と M-5（school_id／学校・年度テーブル）
-前提とする正本: `docs/DESIGN.md` v0.6（§2 原則3、§4 冒頭、§4.1、§9、§10）
+前提とする正本: `docs/DESIGN.md` v0.6（§2 原則3・6、§4 冒頭、§4.1、§9、§10）
+照合した school-timetable: `overdozer1124/school-timetable` の `2026-06-02-v5-only-branch`（ba73531）
 
 ---
 
-## 0. 要点
+## 0. 確定した判断（2026-11-07、荒木の回答）
 
-- **M-5 を先にやり、M-1 はその上に載せる。** 権限は「誰が・どの学校で・何をできるか」なので、学校（テナント）の単位が先に決まっていないと定義できない。
-- **テナント分離は「全業務テーブルに school_id を持たせる」方式を推す**（DESIGN §4 冒頭のとおり）。SQLite／libsql には行レベルセキュリティ（RLS）が無い。そこで、**学校で絞り込まない問い合わせを書けない DB 入口**（`tenantDb`）と、**学校をまたぐ参照を作れない複合外部キー**の2つで分離を守る。
-- **認可はサーバーのアクション層で必ず判定する。** 48個のアクションすべてを、必要な権限を宣言する `secureAction` で包む。宣言のないアクションは登録できないようにする。
-- **公開範囲の絞り込みはサーバーへ移す。** PR #1 で作った `client/src/audience.ts` の純粋関数を共有モジュールにして、`getRange`／`getBootstrap` が利用者の権限に応じて**返すデータそのもの**を絞る。クライアントから来る audience は信用しない。
-- 未確定の前提が1つある：**本番の実行基盤が「ログイン中の利用者」をアクションに渡せるか**。試作の Hatch ランタイム（`ctx`）にその口があるかはコードからは分からない。§3.1 で、どちらの場合も成り立つ形にしてある。
+| # | 判断事項 | 決定 |
+|---|---|---|
+| D-7 | school-timetable との関係 | **別アプリとして作り、同じ学校 ID で強く連携する**（§1.2） |
+| D-1 | テナント分離の方式 | **行に school_id**。学校 ID の形式は school-timetable に合わせる（文字列＋slug） |
+| D-1' | 学校・利用者・ログイン・契約の正本 | **共通基盤を切り出す**。時間割と行事予定の両方がそれを参照する |
+| D-2 | ログイン方式 | **Google＋パスワード**（school-timetable の現状のまま）。所属は管理者が承認する |
+| D-3 | 保護者・児童生徒への公開 | **公開 URL＋PDF 配布**。保護者・児童生徒にアカウントは配らない |
+| D-4 | 役割 | **製品ごとに役割を持つ**。名前は両製品で Admin／Editor／Viewer に揃える |
+| D-5 | 休暇の分類 | **管理者と本人だけに見せる** |
+| D-6 | 一般教職員による出張・研修・休暇の入力 | **許す。ただし行事担当が確認する**（確認までは「仮」） |
+
+荒木の回答（D-7、原文）：
+
+> 私の最初の考えは時間割アプリで行事予定も使えたらいいのではないかという考えでした。おそらく時間割アプリに行事予定管理機能がついていると使い勝手が良くなるという人は多いと思います。しかし、行事予定管理アプリだけ必要という人からすると、それを使うためだけに親アプリである時間割アプリを使う人はいないのではないかと考えました。そのため、時間割アプリと行事予定管理アプリを独立させ、別々のアプリとして作るほうがいいのではないかと思いました。しかし、強力な連携機能は絶対に必要になります。例えば、行事予定で出張に登録した先生を時間割アプリにもリアルタイムに反映させたり、行事を時間割に反映させたりすることで時間割運用を効率化するなど連携することでこれまで別々に管理していた行事と時間割の一元化が可能になると考えているからです。この連携には同じ学校IDでの管理は絶対に必要だと考えています。
 
 ---
 
-## 1. 現状（このリポジトリのコードで確認した事実）
+## 1. 前提
+
+### 1.1 このリポジトリの現状（コードで確認）
 
 | 項目 | 現状 |
 |---|---|
-| 実行基盤 | `@hatch/space-sdk` の `defineAction`。DB は `ctx.db()`（drizzle + libsql／SQLite）。`ctx` に利用者の情報は渡っていない（`ctx.db` と `ctx.invalidateQueries` しか使われていない） |
+| 実行基盤 | `@hatch/space-sdk` の `defineAction`。DB は `ctx.db()`（drizzle + libsql／SQLite）。`ctx` に利用者の情報は渡っていない |
 | テナント | 無い。`settings` が `id=1` の1行だけの表で、学校名・年度（既定 2026）を持つ |
-| 学校・年度テーブル | `schools`／`school_years`／`terms` は存在しない（DESIGN §4.1 にはある） |
-| entitlement | `product_entitlements.school_name`（**学校名の文字列**）で学校を表している |
+| 学校・年度テーブル | `schools`／`school_years`／`terms` は無い（DESIGN §4.1 にはある） |
+| entitlement | `product_entitlements.school_name`（学校名の文字列）で学校を表している |
 | 業務テーブル | 24個。どれも school_id を持たない |
-| 利用者・権限 | 無い。アクションは全員が全件を読み書きできる |
-| 公開範囲 | クライアント側だけ（`client/src/audience.ts`）。サーバーは全データを返す。当番パネルは絞り込み前のデータを直接受け取る（REVIEW-RESPONSE の申し送り） |
-| 監査情報 | 誰が作成・変更したかを持たない（`duty_changes.requested_by`、`duty_conflict_waivers.waived_by` も無い） |
+| 利用者・権限 | 無い。全員が48個のアクションすべてで全件を読み書きできる |
+| 公開範囲 | クライアント側だけ（`client/src/audience.ts`）。当番パネルは絞り込み前のデータを受け取る（REVIEW-RESPONSE の申し送り） |
+
+### 1.2 school-timetable（v5）の作り（照合結果）
+
+| 項目 | school-timetable の作り | 根拠 |
+|---|---|---|
+| DB | Postgres（drizzle の `pgTable`） | `drizzle/src/schema.ts` |
+| 学校 | `schools.school_id` は **text の主キー**。URL 用の `slug` を持つ（全校で一意） | `drizzle/src/schema.ts` 7–16行 |
+| テナント分離 | 業務テーブルは `school_id` を持ち、主キーが (school_id, x_id) の複合キー。絞り込みは `withSchoolId()` | `drizzle/src/schema.ts`、`server/src/utils/tenantIsolation.ts` |
+| 利用者 | `users` の主キーは (school_id, user_id)。学校ごとに1行で、`google_id`・`password_hash`・`teacher_id`（教員との紐付け）・`membership_approved_at`（所属承認） | `drizzle/src/schema.ts` 42–59行 |
+| ログイン | Google OAuth とパスワード（bcrypt）、JWT。所属が未承認の JWT は無効 | `server/src/utils/auth.ts` |
+| 役割 | SuperAdmin／Admin／Editor／Viewer。tRPC の `createRoleProcedure` で判定し、Viewer の変更操作は許可リスト方式 | `server/src/trpc.ts` |
+| 公開閲覧 | `school_settings.public_view_token`（管理者が発行・無効化）。未ログインは `__public__` 利用者になり、**許可した query だけ**を通す（allowlist） | `server/src/index.ts`、`server/src/publicViewQueryPolicy.ts` |
+| URL | `school-manage.jp/{slug}/timetable`。`/{slug}/schedule` を行事用に予約 | `docs/v5-planning/29-school-manage-url-routing-plan.md` |
+
+**食い違いの整理**：school-timetable の `docs/event-management-system-design.md` は「行事管理は時間割と同じ SPA・同じ DB・同じ認証のサブアプリ」としている。D-7 の決定（別アプリ＋同じ学校 ID で連携）でこの案は採らないことになるので、同文書は「不採用（2026-11-07 の判断で置き換え）」と明記して更新する必要がある。school-timetable リポジトリの運用（CLAUDE.md）に従い、その更新は先方で Task として起票する。
 
 ---
 
-## 2. M-5：テナント分離
+## 2. 全体構成
 
-### 2.1 方式の比較
+```
+school-manage.jp
+ ├─ 共通基盤（新設）        … 学校・利用者・ログイン・所属承認・製品ごとの役割・契約・公開トークン
+ │    ├─ /login, /{slug}/          ← 入口
+ │    └─ 認証 API（JWT 発行・検証）
+ ├─ 時間割  /{slug}/timetable  … 自前の DB（Postgres）。学校 ID と利用者は共通基盤を参照
+ └─ 行事予定 /{slug}/schedule  … 自前の DB。学校 ID と利用者は共通基盤を参照
+                                   ↕ 連携（同じ school_id・教員 ID で、出張・行事を時間割へ反映）
+```
 
-| 方式 | 中身 | 長所 | 短所 |
-|---|---|---|---|
-| **A. 行に school_id（推奨）** | 1つの DB。全業務テーブルに `school_id` を持たせる | DESIGN §4 と一致し、school-timetable と同じ方針。entitlement・連携・テンプレート共有のように学校をまたぐ処理が素直に書ける。実行基盤が DB を1つしか渡さなくても実現できる | WHERE の書き忘れが漏えいに直結する（RLS が無い）。§2.4 の仕組みで防ぐ必要がある |
-| B. 学校ごとに DB を分ける | libsql の DB／ファイルを学校ごとに用意する | 書き忘れても他校のデータは物理的に見えない。学校単位のバックアップ・削除が容易 | 実行基盤が学校ごとに DB を開ける必要がある（試作の `ctx.db()` は1つだけ）。学校をまたぐ処理（entitlement、運営側の集計）に別の DB が要る。マイグレーションを学校の数だけ流すことになる |
-| C. 併用 | 共通の DB（学校・利用者・契約）と学校ごとの業務 DB | 分離が強く、学校をまたぐ処理も書ける | 構成が最も複雑 |
+- **片方だけ契約した学校でも成り立つ**：共通基盤はどちらの製品にも属さない。行事予定だけの学校は「共通基盤＋行事予定」で動き、時間割のサーバーには依存しない（DESIGN §10.0・§10.1）。
+- **共通基盤は school-timetable の既存部品から切り出す**：`schools`・`users`・ログイン（Google OAuth＋パスワード、JWT）・所属承認・公開トークンはすでに時間割側にあるので、作り直さずに移す。移す作業は時間割側の工程になる（§6）。
+- **DB は製品ごとに分ける**：行事予定の業務データは行事予定の DB に置く。学校をまたいだ集計や契約は共通基盤の責務なので、各製品の DB は「1校の業務データ」だけに集中できる。
 
-**推奨は A。** 1校1年分のデータは小さく（予定・日次値・割当で数千〜数万行）、DB を分ける性能上の理由が無い。また DESIGN §10 の連携（school-timetable と school_id を共有する）は A を前提にしている。
-ただし本番の実行基盤が学校ごとの DB を簡単に扱え、運営側の要件で物理分離が求められるなら、B を再検討する。判断事項 D-1 として §5 に挙げる。
+---
 
-### 2.2 追加するテーブル（DESIGN §4.1 準拠）
+## 3. M-5：テナント分離（行事予定アプリ側）
+
+### 3.1 school_id
+
+- 全24業務テーブルに `school_id TEXT NOT NULL` を持たせる。値は**共通基盤の `schools.school_id` そのもの**で、時間割側と同じ値になる。連携はこの一致を前提にする。
+- 行事予定の DB に `schools` の正本は置かない。表示用に学校名と slug をキャッシュする `school_cache`（school_id PK, name, slug, synced_at）だけを持つ。
+- 子テーブル（`item_options`・`targets`・`event_assignees` など）にも `school_id` を持たせる。目的は2つある。
+  - 「必ず school_id で絞る」を例外のない規則にする。
+  - 親子が同じ学校であることを複合外部キーで保証する（§3.3②）。
+- 主キーは、時間割に倣って (school_id, id) の複合にするか、現行の整数 id のまま UNIQUE(school_id, id) を足すかを実装で選ぶ。どちらでも §3.3 の守りは成り立つ。移行の手間が小さい後者を推奨する。
+
+### 3.2 学校ごとの設定・年度
 
 | テーブル | 主要カラム | 備考 |
 |---|---|---|
-| `schools` | id PK, name, school_type, prefecture, created_at | `settings` の学校名をここへ移す。連携モードでは school-timetable と同じ ID 体系にする（§10.3 の注意） |
-| `school_settings` | school_id PK/FK, preset_applied, leave_types_json, link_mode, people_source, targets_source, periods_source | 現在の `settings` の残り。1校に1行 |
-| `school_years` | id PK, school_id FK, year, starts_on, ends_on, term_system, is_current | `settings.school_year`（既定 2026）を置き換える。is_current は学校ごとに1行だけ（部分一意インデックス） |
-| `terms` | id PK, school_id FK, school_year_id FK, name, starts_on, ends_on, sort | 長期休業の期間判定（当番の「長期休業のみ」）にも使える |
+| `school_settings` | school_id PK, preset_applied, leave_types_json, absence_categories_json, link_mode, *_source | 現在の `settings` の1行を置き換える。R-1(a)（不在種別を設定にする）もここに入れる |
+| `school_years` | id, school_id, year, starts_on, ends_on, term_system, is_current | `settings.school_year`（既定 2026）を置き換える（N-3）。年度を時間割と共有するかは連携設計で決める（§7） |
+| `terms` | id, school_id, school_year_id, name, starts_on, ends_on, sort | 長期休業の期間判定にも使える |
 
-**年度は行に持たせない。** 予定・日次値・割当はすべて日付を持つので、どの年度かは日付と `school_years` から導ける。定義系（項目・当番・ビュー）は学校単位で年度をまたいで使う。年度ごとに変わるもの（輪番の顔ぶれなど）が出てきたら、そのとき有効期間の列を足す。
+年度は業務データの各行には持たせない。どの年度かは日付と `school_years` から導ける。
 
-### 2.3 既存テーブルの変更
+一意制約は学校単位にする：`day_records` は UNIQUE(school_id, date)、`item_definitions` は UNIQUE(school_id, key)、`target_groups.key`・`period_patterns.code`・`view_definitions.name` も (school_id, …)、`item_options` は UNIQUE(item_definition_id, code)。
 
-**全24テーブルに `school_id INTEGER NOT NULL` を追加する。** 子テーブル（`item_options`・`targets`・`period_definitions`・`rotation_members`・`event_assignees`・`event_targets`）にも持たせる。理由は2つある。
+`product_entitlements` と `master_links` の扱い：
+- `product_entitlements` は共通基盤へ移す。行事予定の DB からは削除する。
+- `master_links` は行事予定側に残し、`school_id` を付ける。
 
-1. 子テーブルも直接問い合わせているため（例：`loadEvents` は `event_assignees` を全件取得している）。全テーブルに持たせれば「必ず school_id で絞る」を例外なしの規則にできる。
-2. 親子が同じ学校であることを、複合外部キーで保証できる（§2.4②）。
+### 3.3 書き忘れを防ぐ仕組み
 
-一意制約は学校単位にする：
-
-| 現在 | 変更後 |
-|---|---|
-| `day_records.date` UNIQUE | UNIQUE(school_id, date) |
-| `item_definitions.key`（アプリ側で重複チェック） | UNIQUE(school_id, key) |
-| `target_groups.key`、`period_patterns.code`、`view_definitions.name` など | UNIQUE(school_id, …) |
-| `item_options` の code（PR #1 でアプリ側の差分キーにした） | UNIQUE(item_definition_id, code) |
-
-`product_entitlements` は `school_name` を `school_id` に置き換える（学校名の変更で契約が外れる問題もなくなる）。`master_links` も学校単位にする。
-
-### 2.4 書き忘れを防ぐ仕組み（A を選ぶ場合の必須条件）
-
-RLS が無いので、**正しく書くのが簡単で、誤って書くのが難しい**形にする。
+SQLite には行単位のアクセス制御（RLS）が無い。そこで、正しく書くのが簡単で、誤って書くのが難しい形にする。
 
 ① **DB の入口を `tenantDb(auth)` に限定する**
-- アクションのハンドラは `ctx.db()` を直接使わず、`secureAction`（§3.3）が渡す `tdb` だけを使う。
-- `tdb.select(table)`／`tdb.update(table)`／`tdb.delete(table)` は `where school_id = auth.schoolId` を必ず付け、`tdb.insert(table)` は `school_id` を自動で埋める。drizzle のクエリビルダーを包む薄いラッパーにする。
-- 学校をまたぐ処理（運営側の entitlement 管理など）だけが `ctx.db()` の生の DB を使う。その場所は `platformDb` という名前で区別し、使える場所をリントで限定する（例：`no-restricted-syntax` で `ctx.db(` の使用を `server/src/platform/` 以下に制限する）。
+- アクションのハンドラは `ctx.db()` を直接使わず、`secureAction`（§4.3）が渡す `tdb` だけを使う。
+- `tdb` は select／update／delete に `school_id = auth.schoolId` を必ず付け、insert では `school_id` を自動で埋める。時間割の `withSchoolId()` と同じ考え方を、付け忘れられない形にしたもの。
+- 生の `ctx.db()` を使ってよいのは `server/src/platform/` 以下（共通基盤との同期など）だけにし、リントで検査する。
 
 ② **学校をまたぐ参照を作れないようにする**
-- 親テーブルに UNIQUE(school_id, id) を張り、子から FOREIGN KEY (school_id, parent_id) REFERENCES parent(school_id, id) で参照する。こうすると、A校の予定がB校の場所 ID を指すような行は DB が受け付けない。
-- ただし SQLite の外部キーは `PRAGMA foreign_keys=ON` が無いと効かず、試作の実行基盤でそれが有効かは不明（レビューの「確認できなかったこと」）。そこでアプリ側でも、**リクエストに含まれる ID がその学校のものか**を書き込み前に確認する（`assertOwned(tdb, table, ids)`）。対象は locationId、personId、targetIds、itemDefinitionId、dutyDefinitionId、assignmentId、viewDefinitionId など、引数で受け取るすべての参照 ID。
+- 親テーブルに UNIQUE(school_id, id) を張る。子から FOREIGN KEY (school_id, parent_id) REFERENCES parent(school_id, id) で参照する。
+- SQLite の外部キーが有効か（`PRAGMA foreign_keys`）は実行基盤次第なので、アプリ側でも確認する。リクエストに含まれる参照 ID（locationId、personId、targetIds、itemDefinitionId、dutyDefinitionId、assignmentId、viewDefinitionId など）が、その学校のものかを書き込み前に `assertOwned` で確かめる。
 
 ③ **テストで担保する**
-- 分離テスト：A校とB校のデータを用意し、B校の利用者で全アクションを呼ぶ。そのうえで「A校の ID を指定した読み取り・更新・削除がすべて失敗する（または0件になる）」ことを確かめる。PR #1 の結合テストの仕組み（libsql の一時 DB＋マイグレーション）をそのまま使い、CI で常に回す。
-- 静的チェック：`server/src/` 内で `ctx.db(` を `platform/` 以外が使っていないことを、リントかテストで検査する。
+- 分離テスト：2校分のデータを用意し、B校の利用者で全アクションを呼ぶ。A校の ID を指定した読み取り・更新・削除がすべて失敗することを確かめる。PR #1 の結合テスト（libsql の一時 DB＋マイグレーション）の仕組みを使い、CI で常に回す。
 
-### 2.5 移行手順（SQLite／drizzle のマイグレーション）
+### 3.4 移行（SQLite）
 
-試作データを持つ学校が1つある前提で、既存データをすべて `school_id = 1` に寄せる。
+試作のデータは、共通基盤に登録したときにその学校へ振られた school_id に寄せる。
 
-1. `0007`：`schools`・`school_settings`・`school_years`・`terms` を作成し、`settings` の1行から `schools(id=1)`・`school_settings`・`school_years(year=settings.school_year, is_current=1)` を作る。
-2. `0008`：全業務テーブルに `school_id INTEGER NOT NULL DEFAULT 1` を ADD COLUMN する。SQLite の ADD COLUMN は既定値つきなら既存の行を書き換えずに済む。
-3. `0009`：一意制約と複合外部キーの張り替え。SQLite は制約を ALTER できないので、**テーブルの作り直し**（新テーブル作成 → INSERT … SELECT → 旧テーブル削除 → 名前変更）になる。対象は、制約を変えるテーブルと複合外部キーを持たせるテーブル。`PRAGMA foreign_key_check` で整合を確認してから確定する。
-4. `0010`：`product_entitlements.school_name` → `school_id`（学校名が一致する行は 1、それ以外は移行時に一覧を出して手で振り分ける）。
-5. `DEFAULT 1` を外す（以後は `tenantDb` が必ず埋める）。これも作り直しが要るので、3 と同時に行ってよい。
-6. 最後に `settings` テーブルを削除する。
+1. `school_settings`・`school_years`・`terms`・`school_cache` を作り、`settings` の1行から作る。
+2. 全業務テーブルに `school_id TEXT NOT NULL DEFAULT '<試作校の school_id>'` を ADD COLUMN する。
+3. 一意制約と複合外部キーを張り替える。SQLite では制約を ALTER できないので、テーブルを作り直す。`PRAGMA foreign_key_check` で整合を確かめてから確定する。DEFAULT もここで外す。
+4. `product_entitlements` を共通基盤へ移し、`settings` を削除する。
 
-アプリ側は、手順 2 の直後から `tenantDb` を使う形に切り替える。手順 1〜2 だけなら既存の動作は変わらないので、M-1 の前に単独でリリースできる。
+手順 1〜2 だけなら動作は変わらないので、認証より先に単独でリリースできる。
 
 ---
 
-## 3. M-1：認証・認可
+## 4. M-1：認証・認可
 
-### 3.1 利用者の識別（認証）
+### 4.1 ログイン（共通基盤）
 
-アクションに「誰が呼んだか」が届かないと、何も判定できない。届け方は実行基盤によって決まる。
-
-| 経路 | 内容 | 採否 |
-|---|---|---|
-| 実行基盤のログイン | 基盤がログイン済みの利用者（ID・メール）を `ctx` に載せる | 本番の基盤にこの口があれば最優先で使う（要確認：D-2） |
-| OIDC（Google／Microsoft） | 学校の Google Workspace／Microsoft 365 アカウントでログインする。GIGA スクールで教職員・児童生徒が学校のアカウントを持っている場合が多い | 基盤に口が無ければこれを推奨。DESIGN §10 の school-timetable との SSO も同じ ID 基盤に寄せる |
-| 独自のメール＋パスワード | アプリ側でパスワードを管理する | 推奨しない（パスワード管理と再設定の責任を負うことになる） |
-
-どの経路でも、アクション層が受け取るのは次の `AuthContext` だけにして、経路の違いは「アダプタ」1か所に閉じ込める。
+- 方式は **Google OAuth＋パスワード**、JWT、管理者による所属承認（school-timetable の現状のまま、D-2）。
+- 行事予定アプリはログイン画面を持たない。共通基盤が発行した JWT を検証して、次の `AuthContext` を得る。
 
 ```ts
 type AuthContext = {
-  userId: number;
-  schoolId: number;      // この操作の対象校（複数校に所属する利用者は選んだ1校）
-  role: Role;            // §3.2
-  audienceRank: number;  // 0=職員, 1=保護者, 2=生徒, 3=公開
-  personId: number | null; // 教職員なら people の行と結び付ける（「自分の出張」の判定用）
+  userId: string;            // 共通基盤の利用者 ID
+  schoolId: string;          // 共通基盤の school_id（= 時間割と同じ値）
+  role: "Admin" | "Editor" | "Viewer";  // 行事予定の役割（製品ごと、§4.2）
+  isSuperAdmin: boolean;     // 運営（共通基盤の SuperAdmin）
+  personId: number | null;   // 行事予定の people の行（「自分の出張・休暇」の判定用）
+  teacherId: string | null;  // 共通基盤の教員 ID（時間割との連携用、§7）
 };
 ```
 
-### 3.2 利用者・所属・役割
+- **ログイン手段の違いは「アダプタ」1か所に閉じ込める**。試作の Hatch ランタイムから本番の基盤に移るときも、アクション層には手を入れずに済む。
+- 未ログインの公開閲覧は §4.5 の公開トークンで扱い、`AuthContext` とは別の型にする。こうしておくと、公開閲覧で書き込みのアクションを呼べないことを型で保証できる。
 
-| テーブル | 主要カラム | 説明 |
+### 4.2 役割（製品ごと、D-4）
+
+共通基盤の所属（学校×利用者）に、製品ごとの役割を持たせる。例：`product_roles`（school_id, user_id, product, role）。時間割では Editor でも、行事予定では Viewer、という持ち方ができる。
+
+| 行事予定の role | 中身 | できること |
 |---|---|---|
-| `users` | id PK, email, display_name, auth_provider, auth_subject, created_at | 学校をまたいで1人1行。UNIQUE(auth_provider, auth_subject) |
-| `memberships` | id PK, school_id FK, user_id FK, role, person_id FK nullable, status（active/invited/suspended）, created_at | 学校への所属。UNIQUE(school_id, user_id)。教職員は person_id で `people` と結ぶ |
-| `invitations` | id PK, school_id FK, email, role, token_hash, expires_at, accepted_at | 管理者による招待。トークンはハッシュだけを保存する |
+| `Admin` 管理者 | DESIGN §9 の「管理者」 | すべて。定義（項目・対象軸・当番定義・日課・ビュー）、マスタ、プリセット、テンプレート、連携設定、公開トークンの発行・無効化、休暇分類の閲覧 |
+| `Editor` 行事担当 | 「行事担当」 | 予定・日次値・日レコード・当番割当・交代・見送り・輪番・CSV 取込・発行・印刷。**教職員が登録した「仮」の出張・研修・休暇の確認（確定）** |
+| `Viewer` 一般教職員 | 「一般教職員」 | 職員用の閲覧。**自分が担当者の出張・研修・休暇の登録・編集（「仮」として入る）**。自分の当番の交代の申し出 |
+| SuperAdmin | 運営（共通基盤） | 契約（entitlement）の管理。学校の役割としては扱わない |
 
-**役割**（DESIGN §9「管理者／行事担当／一般教職員」＋閲覧者）：
+保護者・児童生徒は利用者として登録しない（D-3）。公開は §4.5 で扱う。
 
-| role | audienceRank | できること |
-|---|---|---|
-| `admin` 管理者 | 0 | すべて。定義（項目・対象軸・当番定義・日課・ビュー）、マスタ、プリセット、テンプレート取込、連携設定、所属・招待の管理、発行 |
-| `editor` 行事担当 | 0 | 予定・日次値・日レコード・当番割当・交代・見送り・輪番適用・CSV 取込・発行・印刷 |
-| `staff` 一般教職員 | 0 | 職員用の閲覧。**自分が担当者になっている** 出張・研修・休暇の作成と編集。自分の当番の交代の申し出（R-4 の status=proposed） |
-| `guardian` 保護者 | 1 | audience=guardian 以上のビューの閲覧だけ |
-| `student` 児童生徒 | 2 | audience=student 以上のビューの閲覧だけ |
-| （ログインなし） | 3 | **公開を明示したビュー・発行版だけ**。§3.6 |
+### 4.3 アクション層での強制
 
-権限の細かさ（例：「当番担当」を別の役割にするか）は学校によって違いうる。最初は上の5つで固定して、要望が出たら role を権限の束（`role_permissions`）に分解する。判断事項 D-4。
+- 全アクションを `secureAction({ permission, request, response, handler })` で包む。`Actions` の型を `Record<string, SecureAction | PublicAction>` にして、どちらも通っていないアクションは型エラーになるようにする。
+- `secureAction` の処理順：
+  1. JWT を検証して `AuthContext` を得る（無ければ 401）。
+  2. 所属の承認と、行事予定の契約が有効かを確かめる（無効なら 403）。
+  3. `permission` を役割と照合する（足りなければ 403）。
+  4. `tenantDb(auth)` を作り、ハンドラを呼ぶ。
+- 「自分の出張だけ」のような行単位の判定は、`canEditEvent(auth, event)` のような純粋関数にして、単体テストを付ける。
 
-### 3.3 アクション層での強制
+### 4.4 アクションと必要な権限（現行の48アクション）
 
-- `defineAction` を直接使わず、必要な権限を宣言する `secureAction` で包む。
+| 権限 | 対象アクション | Admin | Editor | Viewer |
+|---|---|---|---|---|
+| `view.read` | getBootstrap, getRange, getSummary | ○ | ○ | ○ |
+| `event.write` | createEvent, updateEvent, deleteEvent, moveEvent | ○ | ○ | △自分が担当者の出張・研修・休暇だけ。登録は「仮」になる |
+| `event.confirm`（新設） | 仮の予定の確定 | ○ | ○ | － |
+| `daily.write` | setDailyValue, moveDailyValues, setDayRecord | ○ | ○ | － |
+| `duty.write` | setDutyAssignment, previewRotation, applyRotation, applyDutyChange, waiveConflict | ○ | ○ | △自分の割当の交代の申し出だけ |
+| `import.events` | importEvents | ○ | ○ | － |
+| `publish` | createPublication, updatePublication, deletePublication | ○ | ○ | － |
+| `view.layout` | setViewColumnWidths | ○ | ○ | －（列幅はビューの共有設定なので。個人ごとの幅にするなら別の扱い） |
+| `master.write` | upsert／delete の Person, Location, Holiday | ○ | ○（場所・祝日） | － |
+| `definition.write` | upsert／delete の ItemDefinition, TargetGroup, Target, PeriodPattern, DutyDefinition, View | ○ | － | － |
+| `school.admin` | saveSettings, saveLeaveTypes, applyPreset, exportTemplate, importTemplate, saveLinkSettings, upsert／deleteMasterLink、公開トークンの発行・無効化 | ○ | － | － |
+| （共通基盤へ移す） | upsertEntitlement, deleteEntitlement | 学校の Admin でも不可。運営（SuperAdmin）だけ | | |
 
-```ts
-secureAction({
-  permission: "event.write",          // §3.4 の表のどれか。"public" も明示の宣言として扱う
-  request, response,
-  async handler({ auth, tdb, ctx }, args) { ... },
-});
-```
+### 4.5 公開範囲のサーバー側フィルタと公開 URL（M-1 の中心、D-3）
 
-- `secureAction` の処理は、①アダプタから `AuthContext` を得る（得られなければ 401）、②`permission` を role と照合する（足りなければ 403）、③`tenantDb(auth)` を作る、④ハンドラを呼ぶ、の順。PR #1 の `inTransaction` も `tdb` を受け取る形に揃える。
-- `Actions` の型を `Record<string, SecureAction>` にして、**`secureAction` を通っていないアクションは型エラーになる**ようにする。宣言の付け忘れをコンパイル時に防ぐ。
-- 「自分の予定だけ」のような行単位の判定は、ハンドラ内で `canEditEvent(auth, event)` のような純粋関数で行い、単体テストを付ける。
+**ログインした職員**
+- `getRange({ from, to, viewId })` では、サーバー側で実効ランクを計算する：`max(0, ビューの audience のランク)`。職員が生徒用ビューで「生徒にどう見えるか」を確かめられる。
+- `client/src/audience.ts` の純粋関数を `shared/audience.ts` に移し、サーバーとクライアントの両方から使う。
 
-### 3.4 アクションと必要な権限（現行の 48 アクション）
+**休暇の分類（D-5）**
+- `leave_type` は、Admin と取得者本人（`event_assignees.person_id = auth.personId`）にだけ返す。
+- それ以外の職員には `null` を返し、画面には「休暇」とだけ出す。休暇を取ること自体と取得者名は、当番の競合検出に要るので職員には返す。
+- 集計・CSV 書き出し・テンプレートにも同じ規則を当てる。
 
-| 権限 | 対象アクション | admin | editor | staff | guardian／student |
-|---|---|---|---|---|---|
-| `view.read` | getBootstrap, getRange, getSummary | ○ | ○ | ○ | ○（§3.5 で絞り込み） |
-| `event.write` | createEvent, updateEvent, deleteEvent, moveEvent | ○ | ○ | △自分の出張・研修・休暇だけ | － |
-| `daily.write` | setDailyValue, moveDailyValues, setDayRecord | ○ | ○ | － | － |
-| `duty.write` | setDutyAssignment, previewRotation, applyRotation, applyDutyChange, waiveConflict | ○ | ○ | △自分の割当の交代申し出だけ | － |
-| `import.events` | importEvents | ○ | ○ | － | － |
-| `publish` | createPublication, updatePublication, deletePublication | ○ | ○ | － | － |
-| `view.layout` | setViewColumnWidths | ○ | ○ | ○（ビューの共有設定を変えるので要検討：個人ごとの幅にする案もある） | － |
-| `definition.write` | upsert/delete の ItemDefinition, TargetGroup, Target, PeriodPattern, DutyDefinition, View | ○ | － | － | － |
-| `master.write` | upsert/delete の Person, Location, Holiday | ○ | ○（祝日・場所は可、人は admin のみも選べる） | － | － |
-| `school.admin` | saveSettings, saveLeaveTypes, applyPreset, exportTemplate, importTemplate, saveLinkSettings, upsert/deleteMasterLink | ○ | － | － | － |
-| `platform.admin` | upsertEntitlement, deleteEntitlement | 運営側だけ（学校の admin でも不可。契約は課金境界なので学校には変えさせない） | － | － | － |
+**未ログインの公開閲覧（保護者・児童生徒・地域）**
+- school-timetable の仕組み（`public_view_token`＋allowlist）に揃える。ただし行事予定では、**トークンを学校単位ではなくビュー単位にする**。生徒用・保護者用でトークンを分け、片方だけ無効化できるようにする。
+  - `public_view_tokens`（school_id, view_definition_id, token_hash, created_by, created_at, revoked_at）。トークンはハッシュだけを保存し、Admin が発行・無効化する。
+  - 発行できるのは audience が guardian／student／public のビューだけ。職員用ビューには発行できない。
+- 公開閲覧で呼べるのは `PublicAction` として宣言した読み取りだけ（allowlist）。中身は次のとおり。
+  - `getPublicRange`：トークンのビューの audience で絞った予定と、列に出る項目の日次値。当番・人名・担当者名・休暇は返さない。
+  - `getPublicBootstrap`：学校名、ビュー定義、列に出る項目と対象軸、祝日だけ。
+- **PDF 配布**：発行版（publications）と紐付けて保持する（R-5）。公開 URL は最新の内容、PDF は配った時点の版という役割分担にする。
 
-追加するもの：所属・招待の管理アクション（`school.admin`）、利用者が所属校を選ぶアクション。
+**職員以外に返さないもの**
+- 人の一覧、当番定義と輪番、当番割当・競合・交代履歴、場所マスタ、名寄せ、発行履歴の管理情報、テンプレート。
+- これでレビュー後の申し送りにあった当番パネルの未フィルタ経路も塞がる。
 
-### 3.5 公開範囲のサーバー側フィルタ（M-1 の中心）
+クライアント側の `audience.ts` による絞り込みは、表示の整合のために残す。ただし守りはサーバー側だけが担う。
 
-**実効ランク**＝`max(利用者の audienceRank, 表示するビューの audience のランク)`。教職員が生徒用ビューで「生徒にどう見えるか」を確かめるのは自由だが、生徒が職員用ビューを指定しても職員のランクにはならない。
+### 4.6 一般教職員の入力と確認（D-6）
 
-- `getRange({ from, to, viewId })`：`viewId` を受け取り、サーバー側で実効ランクを計算する。`client/src/audience.ts` の `audienceColumns`／`audienceItems`／`filterRangeForAudience` を `shared/audience.ts` に移し、サーバーとクライアントの両方から使う。職員以外には予定（visibility）、許可された項目の日次値、空の当番・競合・交代履歴だけを返す。
-- `getBootstrap`：職員以外には、ビュー（自分のランクで見られるものだけ）、ビューに出る項目定義、対象軸、祝日、学校名だけを返す。人の一覧、当番定義と輪番、場所、名寄せ、entitlement、発行履歴、テンプレート関係は返さない。
-- 予定の担当者名：職員以外には既定で返さない（DESIGN §9「個人情報を含む項目は既定で閉じる側」）。保護者向け行事で引率教員名を見せたい学校があれば、ビューの設定で明示的に開ける。
-- **休暇の分類（leave_type）は職員にも絞る。** 「病休」「看護」などは健康情報や家庭事情にあたる。admin と取得者本人以外の職員には「休暇」とだけ返し、分類は返さない（判断事項 D-5）。
-- これでレビュー後の申し送りにあった当番パネルの未フィルタ経路も塞がる（職員以外にはそもそも当番データが届かない）。クライアントでは、パネルとヘッダーの競合バッジを `role ∈ {admin, editor, staff}` のときだけ出す。
-- クライアント側の `audience.ts` による絞り込みは残す（表示の整合のため）。ただし、**守りはサーバー側の絞り込みだけが担う**とコメントで明記する。
+- Viewer が登録した出張・研修・休暇は `certainty = "tentative"`（仮）で保存し、`created_by` を記録する。Viewer が自分で「確定」にはできない。
+- Editor／Admin が確認すると `confirmed` になり、`confirmed_by`・`confirmed_at` を記録する。確定済みの予定を Viewer が編集すると、再び仮に戻る。
+- **当番の競合検出は仮の予定も対象にする**。仮であることを表示して、交代の手配を早めに促す。
+- **時間割への反映（§7）は確定した予定だけ**にする。誤登録がそのまま時間割を動かさないようにするため。
+- 行事担当向けに「確認待ちの一覧」を出す。承認ワークフロー（差し戻し・コメント往復など）は DESIGN §1.4 の非目的なので作らない。確認か削除かの二択にとどめる。
 
-### 3.6 ログインしない閲覧（保護者・地域）
+### 4.7 監査・記録
 
-DESIGN §9 の「URL を知っていること自体を権限にしない」と、§9.1 の「アカウントを持たない保護者へは PDF で渡す」を両立させる。
-
-- 既定：保護者・生徒もログインして閲覧する（学校アカウントか招待）。
-- アカウントを配れない学校向け：**発行版（publications）のスナップショット**を配布手段にする。R-5（発行版に中身を持たせる）と一体で、発行時点の内容を固定した PDF／静的ページを作る。共有リンクを使う場合は、推測できない長いトークン・有効期限・失効操作を付け、audience=public か guardian の発行版だけに限る。生きたデータ（getRange）は匿名には一切開けない。
-
-### 3.7 監査・記録（R-1(e)／R-4 の受け皿）
-
-- `events`・`daily_values`・`duty_assignments`：`created_by`、`updated_by`、`updated_at`（user_id）。
-- `duty_changes`：`requested_by`、`approved_by`。from／to は person_id で持ち、`status`（proposed/applied/declined）を実際に使う（R-4）。
+- `events`・`daily_values`・`duty_assignments`：`created_by`・`updated_by`・`updated_at`。`events` には `confirmed_by`・`confirmed_at` も持たせる。
+- `duty_changes`：`requested_by`・`approved_by`。from／to は person_id で持ち、`status`（proposed／applied／declined）を実際に使う（R-4）。
 - `duty_conflict_waivers`：`waived_by`（R-1(e)）。
-- 所属・役割の変更、招待、テンプレート取込、プリセット適用は `audit_log`（school_id, user_id, action, target, at, summary）に残す。
+- 公開トークンの発行・無効化、役割の変更、テンプレートの取込、プリセットの適用は `audit_log` に残す。
 
-### 3.8 通信面
+### 4.8 通信面
 
-- セッションの持ち方は実行基盤に合わせる。Cookie を使う場合は `HttpOnly; Secure; SameSite=Lax` にし、アクション（POST）には CSRF 対策をする（Origin ヘッダーの検査かトークン）。
-- 401／403 はクライアントで区別して扱う（401 はログイン画面へ、403 は「権限がありません」と表示）。現在のエラー表示（設定画面下のトーストなど）をそのまま使える。
+- JWT の受け渡しは共通基盤の方式に合わせる。Cookie なら `HttpOnly; Secure; SameSite=Lax` にし、POST には Origin ヘッダーを検査する。
+- 401 と 403 はクライアントで区別して扱う。401 は共通基盤のログインへ、403 は「権限がありません」と表示する。
 
 ---
 
-## 4. 実施順序
-
-各段階が単独でリリースでき、途中でも既存の動作を壊さない順にしてある。
+## 5. 実施順序（行事予定アプリ側）
 
 | 段階 | 内容 | 完了条件 |
 |---|---|---|
-| 1 | M-5 前半：§2.5 の手順 1〜2（学校・年度テーブル、school_id 列を既定値 1 で追加）。`tenantDb` を導入し、全アクションをそれに切り替える（学校は 1 で固定） | 既存の結合テストが通る。`ctx.db(` が platform 以外に残っていない |
-| 2 | M-5 後半：一意制約・複合外部キーの張り替え（手順 3〜6）。`assertOwned` を追加する | 2校分のデータで分離テストが全アクションで通る |
-| 3 | M-1 前半：認証アダプタ、`users`／`memberships`／`invitations`、`secureAction` と権限表（§3.4） | 未ログインは 401、権限不足は 403 になる。権限表どおりであることを全アクション×全役割のテストで確かめる |
-| 4 | M-1 後半：サーバー側の公開範囲フィルタ（§3.5）、`shared/audience.ts` への移動、bootstrap の削減、当番パネルのゲート | 生徒・保護者の利用者で API を直接呼んでも、職員のみの予定・日次値・当番・人名が返らない |
-| 5 | 監査列（§3.7）、匿名配布（§3.6、R-5 と一体） | — |
+| 1 | §3.4 の手順 1〜2（学校ごとの設定・年度、school_id 列）と、全アクションの `tenantDb` 化（学校は1つで固定） | 既存の結合テストが通る。`ctx.db(` が platform 以外に残っていない |
+| 2 | §3.4 の手順 3〜4（制約の張り替え、`assertOwned`） | 2校分のデータで分離テストが全アクションで通る |
+| 3 | 認証アダプタ（共通基盤の JWT の検証）、`secureAction` と権限表（§4.4）、仮の予定と確認（§4.6） | 未ログインは 401、権限不足は 403。全アクション×全役割のテストが通る |
+| 4 | サーバー側の公開範囲フィルタ、休暇分類の秘匿、公開トークン（§4.5） | Viewer や公開トークンで API を直接呼んでも、許されないデータが返らない |
+| 5 | 監査列（§4.7）、PDF スナップショット（R-5） | — |
 
-段階 1・2 はデータの移行を伴うので、試作データのバックアップを取ってから行う。
-
----
-
-## 5. 判断事項（荒木の判断が必要）
-
-| # | 判断事項 | 推奨 |
-|---|---|---|
-| D-1 | テナント分離の方式（§2.1：行に school_id／学校ごとに DB） | 行に school_id（A） |
-| D-2 | 本番の実行基盤と、利用者の識別をどこに任せるか（§3.1） | 基盤のログインがあればそれを使う。無ければ Google／Microsoft の OIDC |
-| D-3 | 保護者・生徒にアカウントを持たせるか、発行版の配布にするか（§3.6） | 学校が選べるようにする。既定はログインして閲覧、アカウントを配れない学校は発行版の配布 |
-| D-4 | 役割は固定の5種でよいか（§3.2） | まず固定。細かい権限は要望が出てから |
-| D-5 | 休暇の分類を職員の間でも伏せるか（§3.5） | 伏せる（admin と本人だけに見せる） |
-| D-6 | 一般教職員に「自分の出張・休暇」の入力を許すか（§3.4 の △） | 許す（転記の手間を減らせる）。ただし承認ワークフローは非目的（DESIGN §1.4）なので作らない |
-| D-7 | school-timetable 側の利用者・学校 ID の作りに合わせる必要があるか | 要確認。school-timetable のリポジトリをこのセッションから参照できなかったため、本案は DESIGN.md の記述（「school-timetable と同方針」）だけを根拠にしている |
+**段階 3 は共通基盤の完成待ちになる。** それまでは開発用アダプタ（固定の利用者と役割を返す。本番では起動しない）で段階 3〜4 を作り込み、テストできる。
 
 ---
 
-## 6. この案で解消する／しないレビュー指摘
+## 6. 共通基盤の切り出し（school-timetable 側との調整事項）
 
-- 解消：M-1、M-5、R-1(e) の waived_by、R-4 の requested_by／status（列の受け皿）、N-3（年度のハードコード）、REVIEW-RESPONSE の申し送り（当番パネルの未フィルタ経路）。
-- 一部：R-5（匿名配布の仕組みは本案、スナップショットの中身は R-5 側で決める）。
-- 対象外：R-1(a)、R-6、R-7、N-2、N-4（スキーマ設計の別の論点。ただし段階 2 でテーブルを作り直すので、R-6／R-7／N-4 のスキーマ変更を同じ作り直しに相乗りさせると移行が1回で済む）。
+共通基盤は両製品にまたがるので、このリポジトリだけでは完結しない。以下は school-timetable 側の Task として起票・設計する必要がある（school-timetable の運用では、設計は Codex／Muse が Builder・Architect、Claude が起票とレビュー）。
+
+1. **切り出す範囲**：`schools`（school_id・slug・name）、`users` とログイン（Google OAuth・パスワード・JWT）、所属承認、製品ごとの役割（`product_roles`）、契約（`product_entitlements`）、教員 ID（`teacher_id`）と利用者の紐付け。
+2. **利用者の主キー**：時間割の `users` は (school_id, user_id) で、学校ごとに別の行になっている。共通基盤で「1人が複数校に所属する」を扱うかどうかで、`users`（人）と `memberships`（所属）に分けるかが決まる。分けない場合は、現行の作りのまま共通基盤へ移す。
+3. **役割の移行**：時間割の現在の `users.role` を、`product_roles` の timetable 行へ移す。
+4. **公開トークン**：時間割の `school_settings.public_view_token` は時間割の責務のまま残す。仕組み（ハッシュ保存・allowlist）だけを揃える。
+5. **`docs/event-management-system-design.md` の扱い**：「同じ SPA・同じ DB のサブアプリ」案は不採用と明記する（§1.2）。
+
+---
+
+## 7. 連携（出張・行事を時間割へ）— 次の設計の論点
+
+D-7 で「出張に登録した先生をリアルタイムに時間割へ反映」「行事を時間割へ反映」が必須と決まった。詳細は DESIGN §10.3 の拡張として別に設計する。本案で前提だけを決めておく。
+
+- **鍵**：学校は共通基盤の school_id。先生は共通基盤の教員 ID（時間割の `teacher_id`）。行事予定の `people` には `teacher_id` を持たせ、名寄せ（`master_links`）で結び付ける。
+- **向き**：行事予定 → 時間割の一方向とする。行事予定は「何がいつあるか」の一次情報を持ち、時間割はそれを読んで「その先生のコマを空ける／その日をブロックする」を自分の DB で行う（時間割の設計メモ §1.3 の役割分担と一致）。
+- **送るもの**：確定した予定だけ（§4.6）。予定の作成・変更・削除を、school_id 付きのイベントとして送る（outbox 方式。時間割側にも outbox の仕組みがある）。届かなかったときに再送し、二重に届いても結果が変わらないようにする。
+- **リアルタイム性**：イベントは即時に送る。時間割側は受け取ったら反映し、画面へは既存の WebSocket 通知（`broadcastSchoolMutation`）で知らせる。
+- **未決**：年度・学期を両製品で共有するか、時間割側の `annual_events` を行事予定に移すか参照に変えるか、の2点。
+
+---
+
+## 8. この案で解消する／しないレビュー指摘
+
+- **解消**：M-1、M-5、R-1(a)（不在種別を school_settings に持たせる）、R-1(e) の waived_by、R-4 の requested_by／status、N-3（年度のハードコード）、REVIEW-RESPONSE の申し送り（当番パネルの未フィルタ経路）。
+- **一部**：R-5。PDF を発行版に紐付けるところまでは本案に含めた。スナップショットの中身は R-5 側で決める。
+- **対象外**：R-6、R-7、N-2、N-4。ただし段階 2 でテーブルを作り直すので、これらのスキーマ変更を同じ作り直しに相乗りさせると、移行が1回で済む。

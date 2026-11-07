@@ -16,7 +16,7 @@
 
 ## 設計
 
-設計の正本は `docs/DESIGN.md` です（定義駆動モデル、製品境界と school-timetable 連携の方針、フェーズ計画を含む）。
+設計の正本は overdozer1124/school-manage の `docs/` に移りました（[目次](https://github.com/overdozer1124/school-manage/blob/main/docs/README.md)）。このリポジトリは試作の保管用で、凍結しています。試作時点の設計の写しは `docs/DESIGN.md` です（定義駆動モデル、製品境界と school-timetable 連携の方針、フェーズ計画を含む）。
 
 ## 備考
 

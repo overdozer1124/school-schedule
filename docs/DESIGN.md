@@ -4,6 +4,9 @@
 土台: 橋立海青学園「R8行事予定表masterVer.2.01」15シートの読み取り結果 ＋ 全国25件（24校＋1自治体横断表）の公開行事予定表サンプリング調査
 将来連携: school-timetable（overdozer1124/school-timetable、マルチテナント時間割／指導計画アプリ）とは**独立アプリとして連携可能**にする（§10、判断①確定）
 
+
+> **移転のお知らせ（2026-11-07）**：この設計書の正本は overdozer1124/school-manage の [`docs/schedule/DESIGN.md`](https://github.com/overdozer1124/school-manage/blob/main/docs/schedule/DESIGN.md) に移りました。以後の更新はそちらで行います。ここにあるのは、試作（このリポジトリ）を作った時点の写しです。
+
 ---
 
 ## 1. 目的と前提

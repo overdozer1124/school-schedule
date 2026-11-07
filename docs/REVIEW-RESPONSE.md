@@ -9,11 +9,11 @@
 
 | # | 状態 | 対応内容 |
 |---|---|---|
-| M-1 サーバー側の認可・公開範囲フィルタ | ⏸ | 利用者・権限モデルが無いので、サーバー側で audience を引数にしても呼び出し側が `staff` を名乗れば素通りになる。認証基盤とあわせて設計する必要がある。設計案：`docs/DESIGN-AUTH-TENANCY.md` §3。M-2 のクライアント側整理は先に済ませた（`filterRangeForAudience` を本実装でサーバーへ移す前提の形にした）。 |
+| M-1 サーバー側の認可・公開範囲フィルタ | ⏸ | 利用者・権限モデルが無いので、サーバー側で audience を引数にしても呼び出し側が `staff` を名乗れば素通りになる。認証基盤とあわせて設計する必要がある。設計案：[school-manage `docs/DESIGN-AUTH-TENANCY.md`](https://github.com/overdozer1124/school-manage/blob/main/docs/DESIGN-AUTH-TENANCY.md) §3。M-2 のクライアント側整理は先に済ませた（`filterRangeForAudience` を本実装でサーバーへ移す前提の形にした）。 |
 | M-2 クライアントの補助経路からの漏れ | ✅ | 公開範囲の判定を `client/src/audience.ts` に集約した。職員以外のビューでは、日次値を「ビューの列にあり、かつ公開範囲が届く項目」に限定し、当番割当・競合・交代履歴は空にする。カレンダーの記号帯と日詳細は `bootstrap.items` を直接読まず `ctx.items`（絞り込み済み）を使う。印刷側でも同じ関数でもう一度絞り込む。未知の audience は職員扱いではなく最も公開側として扱う（安全側に倒す）。 |
 | M-3 トランザクション不使用 | ✅ | `inTransaction()` を追加し、複数の書き込みを行うアクションをすべて1トランザクションにまとめた：当番の交換・代行、予定の作成・更新・削除、日次値の移動、項目・日課・当番定義の保存、各種削除、プリセット適用、輪番適用、CSV 取込、テンプレート取込。libsql の実 DB で「履歴の insert が失敗したら交換は両方とも戻る」ことを確認済み。 |
 | M-4 選択肢の全削除・再登録 | ✅ | 記号（code）をキーに差分更新するようにした。既存の code は ID を保つ。入力済みの日次値が使っている code の削除は、件数を示したうえで拒否する。code の重複も拒否する。 |
-| M-5 school_id／テナント | ⏸ | 全テーブルに関わる移行で、M-1 と同じく本実装の前提になる。方式（行レベルの school_id か、テナントごとに DB を分けるか）を決めてから着手する。設計案：`docs/DESIGN-AUTH-TENANCY.md` §2。 |
+| M-5 school_id／テナント | ⏸ | 全テーブルに関わる移行で、M-1 と同じく本実装の前提になる。方式（行レベルの school_id か、テナントごとに DB を分けるか）を決めてから着手する。設計案：[school-manage `docs/DESIGN-AUTH-TENANCY.md`](https://github.com/overdozer1124/school-manage/blob/main/docs/DESIGN-AUTH-TENANCY.md) §2。 |
 | M-6 サーバー側の入力検証 | ✅ | 日付（実在日の YYYY-MM-DD、繰り越しは拒否）、時刻（HH:MM）、列挙値（visibility／certainty／datePrecision／slot／当番の粒度と適用期間／値の型／レイアウト／audience）、開始≦終了、時限の前後、文字列長・配列長の上限、JSON 列の形式を検証する。表示期間は開始≦終了とする。詳細モーダルでも保存前に同じ前後関係を確認する。CSV 取込は従来どおり行ごとに判定し、不正な日付の行は理由付きでスキップ、不正な時刻は終日扱いにする。 |
 
 ## 推奨

@@ -261,7 +261,7 @@ type AuthContext = {
 共通基盤は両製品にまたがるので、このリポジトリだけでは完結しない。以下は school-timetable 側の Task として起票・設計する必要がある（school-timetable の運用では、設計は Codex／Muse が Builder・Architect、Claude が起票とレビュー）。
 
 1. **切り出す範囲**：`schools`（school_id・slug・name）、`users` とログイン（Google OAuth・パスワード・JWT）、所属承認、製品ごとの役割（`product_roles`）、契約（`product_entitlements`）、教員 ID（`teacher_id`）と利用者の紐付け。
-2. **利用者の主キー**：時間割の `users` は (school_id, user_id) で、学校ごとに別の行になっている。共通基盤で「1人が複数校に所属する」を扱うかどうかで、`users`（人）と `memberships`（所属）に分けるかが決まる。分けない場合は、現行の作りのまま共通基盤へ移す。
+2. **利用者の主キー**（→ 2026-11-07 確定：「人」と「所属」に分ける。DESIGN-INTEGRATION §8-2-1）：時間割の `users` は (school_id, user_id) で、学校ごとに別の行になっている。共通基盤で「1人が複数校に所属する」を扱うかどうかで、`users`（人）と `memberships`（所属）に分けるかが決まる。分けない場合は、現行の作りのまま共通基盤へ移す。
 3. **役割の移行**：時間割の現在の `users.role` を、`product_roles` の timetable 行へ移す。
 4. **公開トークン**：時間割の `school_settings.public_view_token` は時間割の責務のまま残す。仕組み（ハッシュ保存・allowlist）だけを揃える。
 5. **`docs/event-management-system-design.md` の扱い**：「同じ SPA・同じ DB のサブアプリ」案は不採用と明記する（§1.2）。
